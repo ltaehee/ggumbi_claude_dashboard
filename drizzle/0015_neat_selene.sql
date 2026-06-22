@@ -1,0 +1,1 @@
+ALTER TABLE `monthly_variable_costs` ADD `forecastPct` decimal(6,2);

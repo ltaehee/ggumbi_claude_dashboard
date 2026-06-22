@@ -1,0 +1,1 @@
+ALTER TABLE `sales_targets` ADD CONSTRAINT `uq_sales_targets_dept_item_year_month` UNIQUE(`dept`,`itemMid`,`year`,`month`);

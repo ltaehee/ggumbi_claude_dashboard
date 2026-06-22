@@ -1,0 +1,1 @@
+ALTER TABLE `sales_daily_mart` ADD `totalGrossProfit` decimal(18,2) DEFAULT '0' NOT NULL;

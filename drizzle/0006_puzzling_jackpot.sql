@@ -1,0 +1,1 @@
+ALTER TABLE `naver_rankings` ADD CONSTRAINT `idx_naver_rankings_unique` UNIQUE(`keyword`,`recordedDate`,`productCode`);

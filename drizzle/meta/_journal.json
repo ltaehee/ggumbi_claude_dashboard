@@ -1,0 +1,125 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1779328315013,
+      "tag": "0000_peaceful_living_mummy",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1779328504413,
+      "tag": "0001_concerned_cardiac",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1779330206455,
+      "tag": "0002_tearful_star_brand",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1779330800047,
+      "tag": "0003_jazzy_skrulls",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "5",
+      "when": 1779353893437,
+      "tag": "0004_bitter_kylun",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "5",
+      "when": 1779414864608,
+      "tag": "0005_huge_stranger",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "5",
+      "when": 1779417568618,
+      "tag": "0006_puzzling_jackpot",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "5",
+      "when": 1779425623781,
+      "tag": "0007_giant_purple_man",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "5",
+      "when": 1779757125909,
+      "tag": "0008_empty_richard_fisk",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "5",
+      "when": 1779759545235,
+      "tag": "0009_early_nightmare",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "5",
+      "when": 1779843456715,
+      "tag": "0010_jittery_black_panther",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "5",
+      "when": 1779856882566,
+      "tag": "0011_famous_spencer_smythe",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "5",
+      "when": 1779929317848,
+      "tag": "0012_overrated_talon",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "5",
+      "when": 1780029032004,
+      "tag": "0013_odd_outlaw_kid",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "5",
+      "when": 1780378726441,
+      "tag": "0014_bored_leper_queen",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "5",
+      "when": 1780380358087,
+      "tag": "0015_neat_selene",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "5",
+      "when": 1780536588525,
+      "tag": "0016_goofy_sally_floyd",
+      "breakpoints": true
+    }
+  ]
+}
