@@ -6,10 +6,12 @@ import {
   parsePromotionFile,
   parseSalesFile,
   parseTargetFile,
+  parseProductTargetFile,
+  parseItemManagerFile,
   type FileType,
 } from "./excelPipeline";
 import { queryCache } from "./cache";
-import { rebuildMartFromAllRecords } from "./db";
+import { rebuildMartFromAllRecords, getUnassignedSummary } from "./db";
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
@@ -18,7 +20,7 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 
 type JobStatus =
   | { status: "pending" }
   | { status: "processing"; filename: string; step?: string; progress?: number }
-  | { status: "done"; rowCount: number; replaced: boolean; deletedCount: number; filename: string; martBuilt?: number }
+  | { status: "done"; rowCount: number; replaced: boolean; deletedCount: number; filename: string; martBuilt?: number; unassignedCount?: number; unassignedSales?: number }
   | { status: "error"; error: string; filename: string };
 
 const jobs = new Map<string, JobStatus>();
@@ -59,6 +61,12 @@ router.post("/api/upload", upload.single("file"), async (req, res) => {
         case "target":
           result = await parseTargetFile(file.buffer, file.originalname, uploadedBy);
           break;
+        case "productTarget":
+          result = await parseProductTargetFile(file.buffer, file.originalname, uploadedBy);
+          break;
+        case "managerMap":
+          result = await parseItemManagerFile(file.buffer, file.originalname, uploadedBy);
+          break;
         case "promotion":
           result = await parsePromotionFile(file.buffer, file.originalname, uploadedBy);
           break;
@@ -74,9 +82,10 @@ router.post("/api/upload", upload.single("file"), async (req, res) => {
       if (result.error) {
         jobs.set(jobId, { status: "error", error: result.error, filename: file.originalname });
       } else {
-        // 단계 2: BOM 또는 매출 파일인 경우 마트 자동 재빌드
+        // 단계 2: 매출/BOM/담당자지정 파일인 경우 마트 자동 재빌드
+        //  - 담당자 지정(managerMap): 품번 오버라이드/소분류 매핑이 바뀌므로 마트의 담당자 baking 갱신 필요
         let martBuilt = 0;
-        if (fileType === "bom" || fileType === "sales") {
+        if (fileType === "bom" || fileType === "sales" || fileType === "managerMap") {
           jobs.set(jobId, { status: "processing", filename: file.originalname, step: "rebuilding", progress: 70 });
           try {
             const martResult = await rebuildMartFromAllRecords(true);
@@ -84,6 +93,19 @@ router.post("/api/upload", upload.single("file"), async (req, res) => {
             console.log(`[Upload] 마트 재빌드 완료: ${martBuilt}행`);
           } catch (e) {
             console.warn("[Upload] 마트 재빌드 오류 (무시):", e);
+          }
+        }
+
+        // 담당자 미지정 SKU 요약 (매출/담당자지정 업로드 후)
+        let unassignedCount: number | undefined;
+        let unassignedSales: number | undefined;
+        if (fileType === "sales" || fileType === "managerMap") {
+          try {
+            const u = await getUnassignedSummary();
+            unassignedCount = u.count;
+            unassignedSales = u.totalSales;
+          } catch (e) {
+            console.warn("[Upload] 미지정 SKU 집계 오류 (무시):", e);
           }
         }
 
@@ -95,6 +117,8 @@ router.post("/api/upload", upload.single("file"), async (req, res) => {
           deletedCount: result.deletedCount ?? 0,
           filename: file.originalname,
           martBuilt,
+          unassignedCount,
+          unassignedSales,
         });
       }
     } catch (e) {

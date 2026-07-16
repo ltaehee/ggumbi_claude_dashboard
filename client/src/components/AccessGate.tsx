@@ -1,67 +1,97 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useCallback } from "react";
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
-import { Lock, Eye, EyeOff, TrendingUp } from "lucide-react";
+import { Lock, Eye, EyeOff, TrendingUp, User } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
-const SESSION_KEY = "ggumbi_access_granted";
+const USER_KEY = "ggumbi_user";
+
+export interface StoredUser {
+  id: string;
+  role: string;
+  approved: boolean;
+}
+
+export function getStoredUser(): StoredUser | null {
+  try {
+    const raw = sessionStorage.getItem(USER_KEY);
+    return raw ? (JSON.parse(raw) as StoredUser) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function logout() {
+  try {
+    sessionStorage.removeItem(USER_KEY);
+  } catch {}
+  window.location.reload();
+}
 
 interface AccessGateProps {
   children: React.ReactNode;
 }
 
 export default function AccessGate({ children }: AccessGateProps) {
-  const [granted, setGranted] = useState<boolean>(() => {
-    try {
-      return sessionStorage.getItem(SESSION_KEY) === "true";
-    } catch {
-      return false;
-    }
-  });
+  const [user, setUser] = useState<StoredUser | null>(() => getStoredUser());
+  const [mode, setMode] = useState<"login" | "signup">("login");
+  const [id, setId] = useState("");
   const [password, setPassword] = useState("");
   const [showPw, setShowPw] = useState(false);
   const [error, setError] = useState("");
-  const [shake, setShake] = useState(false);
+  const [pending, setPending] = useState(false); // 승인 대기 안내
 
-  const verifyMutation = trpc.gate.verify.useMutation({
-    onSuccess: () => {
+  const loginMut = trpc.auth.login.useMutation({
+    onSuccess: (data) => {
+      if (!data.approved) {
+        setPending(true);
+        setError("");
+        return;
+      }
+      const u: StoredUser = { id: data.id, role: data.role, approved: true };
       try {
-        sessionStorage.setItem(SESSION_KEY, "true");
+        sessionStorage.setItem(USER_KEY, JSON.stringify(u));
       } catch {}
-      setGranted(true);
-      setError("");
+      setUser(u);
     },
-    onError: (err) => {
-      setError(err.message || "비밀번호가 올바르지 않습니다.");
-      setShake(true);
-      setPassword("");
-      setTimeout(() => setShake(false), 600);
+    onError: (e) => {
+      setError(e.message || "로그인에 실패했습니다.");
+      setPending(false);
     },
   });
 
-  const handleSubmit = useCallback(
+  const signupMut = trpc.auth.signup.useMutation({
+    onSuccess: () => {
+      toast.success("가입 완료! 관리자 승인 후 이용할 수 있습니다.");
+      setMode("login");
+      setPassword("");
+      setError("");
+    },
+    onError: (e) => setError(e.message || "회원가입에 실패했습니다."),
+  });
+
+  const isPendingReq = loginMut.isPending || signupMut.isPending;
+
+  const submit = useCallback(
     (e?: React.FormEvent) => {
       e?.preventDefault();
-      if (!password.trim()) {
-        setError("비밀번호를 입력해주세요.");
+      setError("");
+      setPending(false);
+      if (!id.trim() || !password.trim()) {
+        setError("아이디와 비밀번호를 입력하세요.");
         return;
       }
-      setError("");
-      verifyMutation.mutate({ password });
+      if (mode === "login") loginMut.mutate({ id: id.trim(), password });
+      else signupMut.mutate({ id: id.trim(), password });
     },
-    [password, verifyMutation]
+    [id, password, mode, loginMut, signupMut]
   );
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") handleSubmit();
-  };
-
-  if (granted) return <>{children}</>;
+  if (user?.approved) return <>{children}</>;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#0a0f1e]">
-      {/* Background grid pattern */}
       <div
         className="absolute inset-0 opacity-10"
         style={{
@@ -70,110 +100,106 @@ export default function AccessGate({ children }: AccessGateProps) {
           backgroundSize: "40px 40px",
         }}
       />
-
-      {/* Glow effect */}
       <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] rounded-full bg-indigo-600/10 blur-[120px] pointer-events-none" />
 
-      <div
-        className={`relative z-10 w-full max-w-md mx-4 transition-all duration-150 ${shake ? "animate-[shake_0.5s_ease-in-out]" : ""}`}
-        style={
-          shake
-            ? {
-                animation: "shake 0.5s ease-in-out",
-              }
-            : {}
-        }
-      >
-        {/* Logo / Brand */}
+      <div className="relative z-10 w-full max-w-md mx-4">
         <div className="text-center mb-8">
           <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-indigo-600/20 border border-indigo-500/30 mb-4">
             <TrendingUp className="w-8 h-8 text-indigo-400" />
           </div>
-          <h1 className="text-2xl font-bold text-white tracking-tight">꿈비 국내사업팀 대시보드</h1>
-          <p className="text-sm text-slate-400 mt-1">접근 권한이 필요합니다</p>
-        </div>
-
-        {/* Card */}
-        <div className="bg-slate-900/80 backdrop-blur-xl border border-slate-700/50 rounded-2xl p-8 shadow-2xl">
-          <div className="flex items-center gap-2 mb-6">
-            <Lock className="w-4 h-4 text-indigo-400" />
-            <span className="text-sm font-medium text-slate-300">비밀번호 입력</span>
-          </div>
-
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <div className="relative">
-              <Input
-                type={showPw ? "text" : "password"}
-                value={password}
-                onChange={(e) => {
-                  setPassword(e.target.value);
-                  setError("");
-                }}
-                onKeyDown={handleKeyDown}
-                placeholder="••••"
-                autoFocus
-                className={`
-                  bg-slate-800/60 border-slate-600/50 text-white placeholder:text-slate-500
-                  focus:border-indigo-500 focus:ring-indigo-500/20 pr-10 h-12 text-lg tracking-widest
-                  ${error ? "border-red-500/60 focus:border-red-500" : ""}
-                  transition-colors duration-200
-                `}
-              />
-              <button
-                type="button"
-                onClick={() => setShowPw((v) => !v)}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 transition-colors"
-                tabIndex={-1}
-              >
-                {showPw ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-              </button>
-            </div>
-
-            {error && (
-              <p className="text-sm text-red-400 flex items-center gap-1.5 animate-in slide-in-from-top-1 duration-200">
-                <span className="inline-block w-1 h-1 rounded-full bg-red-400" />
-                {error}
-              </p>
-            )}
-
-            <Button
-              type="submit"
-              disabled={verifyMutation.isPending}
-              className="w-full h-12 bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-sm transition-all duration-150 active:scale-[0.98]"
-            >
-              {verifyMutation.isPending ? (
-                <span className="flex items-center gap-2">
-                  <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                  확인 중...
-                </span>
-              ) : (
-                "로그인"
-              )}
-            </Button>
-          </form>
-
-          <p className="text-xs text-slate-500 text-center mt-6">
-            비밀번호를 분실하셨나요?{" "}
-            <span className="text-slate-400">관리자에게 문의하세요</span>
+          <h1 className="text-2xl font-bold text-white tracking-tight">꿈비 전략사업본부 대시보드</h1>
+          <p className="text-sm text-slate-400 mt-1">
+            {mode === "login" ? "로그인이 필요합니다" : "회원가입 (관리자 승인 후 이용)"}
           </p>
         </div>
 
-        <p className="text-center text-xs text-slate-600 mt-6">
-          © 2026 Ggumbi Co., Ltd. All rights reserved.
-        </p>
-      </div>
+        <div className="bg-slate-900/80 backdrop-blur-xl border border-slate-700/50 rounded-2xl p-8 shadow-2xl">
+          {/* 탭: 로그인 / 회원가입 */}
+          <div className="flex rounded-lg border border-slate-700/50 overflow-hidden mb-6">
+            {(["login", "signup"] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                onClick={() => {
+                  setMode(m);
+                  setError("");
+                  setPending(false);
+                }}
+                className={`flex-1 py-2 text-sm font-medium transition-colors ${
+                  mode === m ? "bg-indigo-600 text-white" : "bg-transparent text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                {m === "login" ? "로그인" : "회원가입"}
+              </button>
+            ))}
+          </div>
 
-      <style>{`
-        @keyframes shake {
-          0%, 100% { transform: translateX(0); }
-          15% { transform: translateX(-8px); }
-          30% { transform: translateX(8px); }
-          45% { transform: translateX(-6px); }
-          60% { transform: translateX(6px); }
-          75% { transform: translateX(-4px); }
-          90% { transform: translateX(4px); }
-        }
-      `}</style>
+          {pending ? (
+            <div className="text-center py-4">
+              <Lock className="w-8 h-8 text-amber-400 mx-auto mb-3" />
+              <p className="text-sm text-amber-300 font-medium">관리자 승인 대기 중입니다.</p>
+              <p className="text-xs text-slate-400 mt-2">승인 후 로그인하면 이용할 수 있습니다. 관리자에게 문의하세요.</p>
+              <Button variant="ghost" className="mt-4 text-slate-400 hover:text-white" onClick={() => setPending(false)}>
+                돌아가기
+              </Button>
+            </div>
+          ) : (
+            <form onSubmit={submit} className="space-y-4">
+              <div className="relative">
+                <User className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
+                <Input
+                  value={id}
+                  onChange={(e) => {
+                    setId(e.target.value);
+                    setError("");
+                  }}
+                  placeholder="아이디"
+                  autoFocus
+                  className="bg-slate-800/60 border-slate-600/50 text-white placeholder:text-slate-500 focus:border-indigo-500 pl-9 h-11"
+                />
+              </div>
+              <div className="relative">
+                <Lock className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
+                <Input
+                  type={showPw ? "text" : "password"}
+                  value={password}
+                  onChange={(e) => {
+                    setPassword(e.target.value);
+                    setError("");
+                  }}
+                  placeholder="비밀번호"
+                  className="bg-slate-800/60 border-slate-600/50 text-white placeholder:text-slate-500 focus:border-indigo-500 pl-9 pr-10 h-11"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPw((v) => !v)}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200"
+                  tabIndex={-1}
+                >
+                  {showPw ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
+
+              {error && (
+                <p className="text-sm text-red-400 flex items-center gap-1.5">
+                  <span className="inline-block w-1 h-1 rounded-full bg-red-400" />
+                  {error}
+                </p>
+              )}
+
+              <Button
+                type="submit"
+                disabled={isPendingReq}
+                className="w-full h-11 bg-indigo-600 hover:bg-indigo-500 text-white font-medium"
+              >
+                {isPendingReq ? "처리 중..." : mode === "login" ? "로그인" : "회원가입"}
+              </Button>
+            </form>
+          )}
+        </div>
+
+        <p className="text-center text-xs text-slate-600 mt-6">© 2026 Ggumbi Co., Ltd. All rights reserved.</p>
+      </div>
     </div>
   );
 }

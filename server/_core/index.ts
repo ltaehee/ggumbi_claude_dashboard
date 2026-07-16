@@ -11,7 +11,7 @@ import { serveStatic, setupVite } from "./vite";
 import uploadRoute from "../uploadRoute";
 import { syncNotionToDb } from "../notionSync";
 import { runIndexMigrations } from "../dbMigrate";
-import { rebuildMartFromAllRecords, getMartRowCount } from "../db";
+import { rebuildMartFromAllRecords, getMartRowCount, ensureAccountsTable, seedAdminAccount } from "../db";
 import { ENV } from "./env";
 
 function isPortAvailable(port: number): Promise<boolean> {
@@ -74,6 +74,18 @@ async function startServer() {
       console.warn("[DB Migrate] 인덱스 마이그레이션 오류:", e)
     );
   }, 3_000);
+
+  // 계정 테이블 생성 + 관리자 시드 (taehee / 0000)
+  setTimeout(async () => {
+    try {
+      await ensureAccountsTable();
+      const bcrypt = await import("bcryptjs");
+      await seedAdminAccount("taehee", bcrypt.hashSync("0000", 10));
+      console.log("[Accounts] 계정 테이블 준비 + 관리자(taehee) 시드 완료");
+    } catch (e) {
+      console.warn("[Accounts] 초기화 오류:", e);
+    }
+  }, 2_000);
 
   // 집계 마트 초기 빌드: 마트가 비어 있으면 sales_records에서 자동 빌드
   setTimeout(async () => {

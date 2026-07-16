@@ -5,16 +5,18 @@ import { trpc } from "@/lib/trpc";
 import { fmtAmt, fmtQty } from "@/lib/format";
 import { DeltaBadge } from "@/components/DeltaBadge";
 import { DateRangeFilter } from "@/components/DateRangeFilter";
+import { TeamFilter } from "@/components/TeamFilter";
 import { useFilters } from "@/contexts/FilterContext";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ArrowLeft, TrendingUp, Package, Search } from "lucide-react";
 import {
-  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, LineChart, Line,
+  XAxis, YAxis, CartesianGrid, Tooltip,
+  ResponsiveContainer, Line, ComposedChart, PieChart, Pie, Cell,
 } from "recharts";
 import { cn } from "@/lib/utils";
+import { CHART_COLORS, CustomTooltip, PieCustomLabel } from "@/components/chartHelpers";
 
 export default function ChannelDetailPage() {
   const [location, navigate] = useLocation();
@@ -22,7 +24,7 @@ export default function ChannelDetailPage() {
 
   const { filters, setDateFilter } = useFilters();
   const filter = filters.dateFilter;
-  const [activeTab, setActiveTab] = useState<"itemLarge" | "itemMid" | "itemSmall" | "itemName">("itemLarge");
+  const [activeTab, setActiveTab] = useState<"itemLarge" | "itemMid" | "itemSmall" | "itemName">("itemName");
   const [searchQuery, setSearchQuery] = useState("");
   const [sortBy, setSortBy] = useState<"totalSales" | "totalQty">("totalSales");
 
@@ -40,15 +42,25 @@ export default function ChannelDetailPage() {
     limit: 50,
   }, { staleTime: 60_000 });
 
+  // 매출/수익 분석과 동일: 주간이면 주별(최근 6개월), 월이면 월별(최근 12개월), 특정기간이면 그 범위
+  const trendGroupBy =
+    filter.mode === "month" ? ("yearMonth" as const)
+    : filter.mode === "day" ? ("day" as const)
+    : ("weekLabel" as const);
+  const trendStartDate = useMemo(() => {
+    if (filter.mode === "custom") return filter.startDate;
+    const base = new Date(filter.startDate);
+    if (filter.mode === "month") base.setMonth(base.getMonth() - 11);
+    else if (filter.mode === "day") base.setDate(base.getDate() - 29);
+    else base.setMonth(base.getMonth() - 6);
+    return base.toISOString().split("T")[0];
+  }, [filter.startDate, filter.mode]);
+
   const trendQuery = trpc.sales.getTrend.useQuery({
-    startDate: (() => {
-      const d = new Date(filter.startDate);
-      d.setFullYear(d.getFullYear() - 1);
-      return d.toISOString().slice(0, 10);
-    })(),
+    startDate: trendStartDate,
     endDate: filter.endDate,
     channels: channelName ? [channelName] : undefined,
-    groupBy: "yearMonth",
+    groupBy: trendGroupBy,
   }, { staleTime: 60_000 });
 
   const kpi = kpiQuery.data as any;
@@ -62,6 +74,12 @@ export default function ChannelDetailPage() {
     return [...filtered].sort((a: any, b: any) => (b[sortBy] ?? 0) - (a[sortBy] ?? 0));
   }, [rawItems, searchQuery, sortBy]);
   const trend = (trendQuery.data ?? []) as any[];
+
+  // 분류별 비중 (현재 선택한 분류 기준 상위 8개)
+  const pieData = useMemo(
+    () => rawItems.slice(0, 8).map((r: any) => ({ name: r.label, value: r.totalSales })),
+    [rawItems]
+  );
 
   const kpiCards = useMemo(() => [
     { label: "채널 매출", value: fmtAmt(kpi?.currSales), yoy: kpi?.yoyPct, mom: kpi?.momPct },
@@ -92,6 +110,7 @@ export default function ChannelDetailPage() {
             <ArrowLeft className="h-3.5 w-3.5" />
             채널별 분석으로
           </Button>
+          <TeamFilter />
           <DateRangeFilter value={filter} onChange={setDateFilter} />
         </div>
       }
@@ -117,32 +136,73 @@ export default function ChannelDetailPage() {
           ))}
         </div>
 
-        {/* 추세 차트 */}
+        {/* 매출 추세 (매출/수익 분석과 동일) */}
         <div className="rounded-xl border border-border bg-card p-4">
-          <div className="flex items-center gap-2 mb-4">
-            <TrendingUp className="h-4 w-4 text-primary" />
-            <h3 className="text-sm font-semibold text-foreground">채널 매출 추세 (12개월)</h3>
+          <div className="flex items-center justify-between mb-4">
+            <div className="flex items-center gap-2">
+              <TrendingUp className="h-4 w-4 text-primary" />
+              <h3 className="text-sm font-semibold text-foreground">매출 추세</h3>
+            </div>
+            <div className="flex items-center gap-3 text-[10px] text-muted-foreground">
+              <span className="flex items-center gap-1"><span className="inline-block w-3 h-0.5 bg-indigo-500"></span>매출(선)</span>
+              <span className="flex items-center gap-1"><span className="inline-block w-3 h-0.5 bg-emerald-500"></span>수량(우축)</span>
+            </div>
           </div>
           {trendQuery.isLoading ? (
-            <Skeleton className="h-52 w-full" />
+            <Skeleton className="h-56 w-full" />
           ) : (
-            <ResponsiveContainer width="100%" height={220}>
-              <LineChart data={trend} margin={{ top: 5, right: 10, left: 0, bottom: 5 }}>
+            <div className="overflow-x-auto">
+            <div style={{ minWidth: Math.max(600, trend.length * 80) }}>
+            <ResponsiveContainer width="100%" height={260}>
+              <ComposedChart data={trend} margin={{ top: 5, right: 40, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                <XAxis dataKey="label" tick={{ fontSize: 9, fill: "var(--muted-foreground)" }} tickLine={false} axisLine={false} />
-                <YAxis
-                  tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
-                  tickLine={false}
-                  axisLine={false}
-                  tickFormatter={(v) => v >= 1_000_000 ? `${(v / 1_000_000).toFixed(0)}M` : v >= 1_000 ? `${(v / 1_000).toFixed(0)}K` : String(v)}
-                />
-                <Tooltip
-                  formatter={(v: number) => [fmtAmt(v), "매출"]}
-                  contentStyle={{ fontSize: 11, borderRadius: 8, border: "1px solid var(--border)", background: "var(--popover)" }}
-                />
-                <Line type="monotone" dataKey="totalSales" name="매출" stroke="#6366f1" strokeWidth={2} dot={{ r: 3 }} activeDot={{ r: 5 }} />
-              </LineChart>
+                <XAxis dataKey="label" tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} tickLine={false} axisLine={false} interval={0} angle={trend.length > 8 ? -30 : 0} textAnchor={trend.length > 8 ? "end" : "middle"} height={trend.length > 8 ? 40 : 20} />
+                <YAxis yAxisId="sales" orientation="left" tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} tickLine={false} axisLine={false} tickFormatter={(v) => v >= 1_000_000 ? `${(v/1_000_000).toFixed(0)}M` : v >= 1_000 ? `${(v/1_000).toFixed(0)}K` : String(v)} />
+                <YAxis yAxisId="qty" orientation="right" tick={{ fontSize: 10, fill: "#10b981" }} tickLine={false} axisLine={false} tickFormatter={(v) => v >= 1_000 ? `${(v/1_000).toFixed(0)}K` : String(v)} />
+                <Tooltip content={(props: any) => <CustomTooltip {...props} groupBy={trendGroupBy} />} />
+                <Line yAxisId="sales" type="monotone" dataKey="totalSales" name="매출" stroke="#6366f1" strokeWidth={2} dot={{ r: 3, fill: "#6366f1" }} activeDot={{ r: 5 }} />
+                <Line yAxisId="qty" type="monotone" dataKey="totalQty" name="수량" stroke="#10b981" strokeWidth={1.5} dot={false} activeDot={{ r: 3 }} strokeDasharray="4 2" />
+              </ComposedChart>
             </ResponsiveContainer>
+            </div>
+            </div>
+          )}
+        </div>
+
+        {/* 분류별 비중 (매출/수익 분석과 동일) */}
+        <div className="rounded-xl border border-border bg-card p-4">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-sm font-semibold text-foreground">분류별 비중</h3>
+            <span className="text-[11px] text-muted-foreground">{TABS.find((t) => t.key === activeTab)?.label} 기준 · 아래 탭으로 변경</span>
+          </div>
+          {perfQuery.isLoading ? (
+            <Skeleton className="h-80 w-full" />
+          ) : pieData.length === 0 ? (
+            <div className="text-center py-12 text-muted-foreground text-sm">데이터가 없습니다.</div>
+          ) : (
+            <div>
+              <ResponsiveContainer width="100%" height={320}>
+                <PieChart margin={{ top: 30, right: 60, bottom: 30, left: 60 }}>
+                  <Pie data={pieData} cx="50%" cy="50%" innerRadius={60} outerRadius={105} paddingAngle={2} dataKey="value" labelLine={false} label={PieCustomLabel}>
+                    {pieData.map((_, i) => <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />)}
+                  </Pie>
+                  <Tooltip formatter={(v: number) => [fmtAmt(v), "매출"]} contentStyle={{ fontSize: 11, borderRadius: 8, border: "1px solid var(--border)", background: "var(--popover)" }} />
+                </PieChart>
+              </ResponsiveContainer>
+              <div className="flex flex-wrap gap-x-3 gap-y-1 mt-1 px-2">
+                {pieData.map((d, i) => {
+                  const total = pieData.reduce((s, r) => s + r.value, 0);
+                  const pct = total > 0 ? ((d.value / total) * 100).toFixed(1) : "0.0";
+                  return (
+                    <div key={d.name} className="flex items-center gap-1 text-[11px]">
+                      <span className="inline-block w-2.5 h-2.5 rounded-sm flex-shrink-0" style={{ background: CHART_COLORS[i % CHART_COLORS.length] }} />
+                      <span className="text-foreground/80 max-w-[80px] truncate">{d.name}</span>
+                      <span className="text-muted-foreground font-medium">{pct}%</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
           )}
         </div>
 
@@ -205,32 +265,6 @@ export default function ChannelDetailPage() {
               </div>
             </div>
           </div>
-
-          {/* 바차트 */}
-          {perfQuery.isLoading ? (
-            <div className="p-4"><Skeleton className="h-48 w-full" /></div>
-          ) : items.length > 0 ? (
-            <div className="p-4">
-              <ResponsiveContainer width="100%" height={Math.max(160, Math.min(items.length, 10) * 28)}>
-                <BarChart data={items.slice(0, 10)} layout="vertical" margin={{ top: 0, right: 50, left: 0, bottom: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" horizontal={false} />
-                  <XAxis
-                    type="number"
-                    tick={{ fontSize: 10, fill: "var(--muted-foreground)" }}
-                    tickLine={false}
-                    axisLine={false}
-                    tickFormatter={(v) => v >= 1_000_000 ? `${(v / 1_000_000).toFixed(0)}M` : v >= 1_000 ? `${(v / 1_000).toFixed(0)}K` : String(v)}
-                  />
-                  <YAxis type="category" dataKey="label" tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} tickLine={false} axisLine={false} width={120} />
-                  <Tooltip
-                    formatter={(v: number) => [sortBy === "totalSales" ? fmtAmt(v) : fmtQty(v), sortBy === "totalSales" ? "매출" : "수량"]}
-                    contentStyle={{ fontSize: 11, borderRadius: 8, border: "1px solid var(--border)", background: "var(--popover)" }}
-                  />
-                  <Bar dataKey={sortBy} name={sortBy === "totalSales" ? "매출" : "수량"} fill="#6366f1" radius={[0, 4, 4, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          ) : null}
 
           {/* 상세 테이블 */}
           <div className="overflow-x-auto">

@@ -33,7 +33,7 @@ export type InsertUser = typeof users.$inferInsert;
 export const uploadedFiles = mysqlTable("uploaded_files", {
   id: int("id").autoincrement().primaryKey(),
   filename: varchar("filename", { length: 255 }).notNull(),
-  fileType: mysqlEnum("fileType", ["sales", "bom", "target", "promotion", "inventory"]).notNull(),
+  fileType: mysqlEnum("fileType", ["sales", "bom", "target", "promotion", "inventory", "managerMap"]).notNull(),
   rowCount: int("rowCount").default(0),
   uploadedAt: timestamp("uploadedAt").defaultNow().notNull(),
   uploadedBy: varchar("uploadedBy", { length: 64 }),
@@ -271,6 +271,8 @@ export const salesDailyMart = mysqlTable(
     totalGrossProfit: decimal("totalGrossProfit", { precision: 18, scale: 2 }).notNull().default("0"),
     rowCount: int("rowCount").notNull().default(0),
     sourceFilename: varchar("sourceFilename", { length: 255 }),
+    manager: varchar("manager", { length: 64 }),   // 담당자 (품번 오버라이드→소분류 매핑 해석 결과, 미지정 시 NULL)
+    team: varchar("team", { length: 64 }),          // 팀
   },
   (t) => [
     index("mart_date_dept").on(t.salesDate, t.dept),
@@ -280,6 +282,8 @@ export const salesDailyMart = mysqlTable(
     index("mart_itemlarge").on(t.itemLarge),
     index("mart_itemname").on(t.itemName),
     index("mart_source").on(t.sourceFilename),
+    index("mart_manager").on(t.manager),
+    index("mart_team").on(t.team),
   ]
 );
 export type SalesDailyMart = typeof salesDailyMart.$inferSelect;

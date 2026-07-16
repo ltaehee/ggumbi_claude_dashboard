@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import { AppLayout } from "@/components/AppLayout";
 import { trpc } from "@/lib/trpc";
 import { toast } from "sonner";
@@ -19,6 +19,7 @@ import {
   RefreshCw,
   Sparkles,
   TrendingDown,
+  Users,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -50,7 +51,11 @@ import {
 } from "@/components/ui/alert-dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { NewProductsTab } from "./NewProductsTab";
+import { cn } from "@/lib/utils";
+import { TEAMS } from "@/components/TeamFilter";
+import { getStoredUser } from "@/components/AccessGate";
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 type TargetRow = {
@@ -1230,7 +1235,265 @@ function PasswordTab() {
 }
 
 // ─── Main AdminPage ────────────────────────────────────────────────────────────
+// ─── 팀 분류 탭 (중분류 → 사업팀 수동 지정) ──────────────────────────────────────
+function TeamMapTab() {
+  const allMids = trpc.filters.getOptions.useQuery({ level: "itemMid" });
+  const teamMapQ = trpc.team.getMap.useQuery();
+  const utils = trpc.useUtils();
+  const saveMut = trpc.team.setMap.useMutation({
+    onSuccess: () => {
+      toast.success("팀 분류가 저장되었습니다.");
+      utils.team.getMap.invalidate();
+    },
+    onError: (e) => toast.error(e.message),
+  });
+
+  // 로컬 할당 상태: 중분류 -> 팀("" | 매트사업팀 | 육아용품사업팀)
+  const [assign, setAssign] = useState<Record<string, string>>({});
+  const [search, setSearch] = useState("");
+
+  // 서버 맵 → 로컬 할당 초기화
+  useEffect(() => {
+    if (!teamMapQ.data) return;
+    const a: Record<string, string> = {};
+    for (const t of TEAMS) for (const mid of teamMapQ.data[t] ?? []) a[mid] = t;
+    setAssign(a);
+  }, [teamMapQ.data]);
+
+  const mids = useMemo(() => {
+    const list = allMids.data ?? [];
+    const q = search.trim().toLowerCase();
+    return q ? list.filter((m) => m.toLowerCase().includes(q)) : list;
+  }, [allMids.data, search]);
+
+  const counts = useMemo(() => {
+    const c: Record<string, number> = { 매트사업팀: 0, 육아용품사업팀: 0, 미지정: 0 };
+    for (const mid of allMids.data ?? []) {
+      const t = assign[mid];
+      if (t === "매트사업팀") c["매트사업팀"]++;
+      else if (t === "육아용품사업팀") c["육아용품사업팀"]++;
+      else c["미지정"]++;
+    }
+    return c;
+  }, [allMids.data, assign]);
+
+  const setTeam = (mid: string, team: string) =>
+    setAssign((prev) => ({ ...prev, [mid]: prev[mid] === team ? "" : team }));
+
+  const save = () => {
+    const map: Record<string, string[]> = {};
+    for (const t of TEAMS) map[t] = [];
+    for (const [mid, t] of Object.entries(assign)) {
+      if (t && map[t]) map[t].push(mid);
+    }
+    saveMut.mutate({ map });
+  };
+
+  return (
+    <div className="rounded-xl border border-border bg-card p-4 space-y-3">
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div>
+          <h3 className="text-sm font-semibold text-foreground">팀 분류 (중분류 → 사업팀)</h3>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            각 중분류를 사업팀에 지정하면 대시보드 팀 필터에서 사용됩니다. 한 번 더 누르면 해제.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="중분류 검색..." className="h-8 text-xs w-40" />
+          <Button size="sm" className="h-8 text-xs" onClick={save} disabled={saveMut.isPending}>
+            {saveMut.isPending ? "저장 중..." : "저장"}
+          </Button>
+        </div>
+      </div>
+      <div className="flex gap-3 text-[11px] text-muted-foreground">
+        <span>매트사업팀 <b className="text-foreground">{counts["매트사업팀"]}</b></span>
+        <span>육아용품사업팀 <b className="text-foreground">{counts["육아용품사업팀"]}</b></span>
+        <span>미지정 <b className="text-foreground">{counts["미지정"]}</b></span>
+      </div>
+      <div className="border border-border rounded-lg divide-y divide-border max-h-[520px] overflow-y-auto">
+        {allMids.isLoading ? (
+          <div className="p-6 text-center text-xs text-muted-foreground">불러오는 중...</div>
+        ) : mids.length === 0 ? (
+          <div className="p-6 text-center text-xs text-muted-foreground">중분류가 없습니다.</div>
+        ) : (
+          mids.map((mid) => (
+            <div key={mid} className="flex items-center justify-between gap-2 px-3 py-2">
+              <span className="text-sm text-foreground truncate">{mid}</span>
+              <div className="flex gap-1 shrink-0">
+                {TEAMS.map((t) => (
+                  <button
+                    key={t}
+                    type="button"
+                    onClick={() => setTeam(mid, t)}
+                    className={cn(
+                      "px-2.5 py-1 rounded text-[11px] border transition-colors",
+                      assign[mid] === t
+                        ? "bg-primary text-primary-foreground border-primary font-medium"
+                        : "bg-background text-muted-foreground border-border hover:bg-muted"
+                    )}
+                  >
+                    {t === "매트사업팀" ? "매트" : "육아"}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── 회원 관리 탭 (관리자만) ────────────────────────────────────────────────────
+function AccountsTab() {
+  const accountsQ = trpc.auth.listAccounts.useQuery();
+  const utils = trpc.useUtils();
+  const refresh = () => utils.auth.listAccounts.invalidate();
+  const approveMut = trpc.auth.approve.useMutation({ onSuccess: () => { toast.success("승인되었습니다."); refresh(); }, onError: (e) => toast.error(e.message) });
+  const revokeMut = trpc.auth.revoke.useMutation({ onSuccess: () => { toast.success("승인이 해제되었습니다."); refresh(); }, onError: (e) => toast.error(e.message) });
+  const removeMut = trpc.auth.remove.useMutation({ onSuccess: () => { toast.success("삭제되었습니다."); refresh(); }, onError: (e) => toast.error(e.message) });
+
+  const accounts = accountsQ.data ?? [];
+  const pending = accounts.filter((a) => !a.approved);
+  const approved = accounts.filter((a) => a.approved);
+
+  return (
+    <div className="rounded-xl border border-border bg-card p-4 space-y-4">
+      <div>
+        <h3 className="text-sm font-semibold text-foreground">회원 관리</h3>
+        <p className="text-xs text-muted-foreground mt-0.5">회원가입한 계정을 승인하면 대시보드를 볼 수 있습니다.</p>
+      </div>
+
+      <div>
+        <h4 className="text-xs font-semibold text-amber-600 mb-2">승인 대기 ({pending.length})</h4>
+        {pending.length === 0 ? (
+          <p className="text-xs text-muted-foreground">대기 중인 가입 요청이 없습니다.</p>
+        ) : (
+          <div className="space-y-1.5">
+            {pending.map((a) => (
+              <div key={a.id} className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg border border-amber-300 bg-amber-50 dark:bg-amber-950/20">
+                <span className="text-sm font-medium text-foreground">{a.id}</span>
+                <div className="flex gap-1.5">
+                  <Button size="sm" className="h-7 text-xs" onClick={() => approveMut.mutate({ id: a.id })}>승인</Button>
+                  <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => removeMut.mutate({ id: a.id })}>거절</Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div>
+        <h4 className="text-xs font-semibold text-foreground mb-2">승인된 회원 ({approved.length})</h4>
+        <div className="border border-border rounded-lg divide-y divide-border max-h-[360px] overflow-y-auto">
+          {approved.length === 0 ? (
+            <div className="p-4 text-center text-xs text-muted-foreground">없음</div>
+          ) : (
+            approved.map((a) => (
+              <div key={a.id} className="flex items-center justify-between gap-2 px-3 py-2">
+                <span className="text-sm text-foreground">
+                  {a.id}
+                  {a.role === "admin" && <span className="text-[10px] text-indigo-600 ml-1.5 font-medium">관리자</span>}
+                </span>
+                {a.role !== "admin" && (
+                  <div className="flex gap-1.5">
+                    <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => revokeMut.mutate({ id: a.id })}>승인해제</Button>
+                    <Button size="sm" variant="outline" className="h-7 text-xs text-destructive" onClick={() => removeMut.mutate({ id: a.id })}>삭제</Button>
+                  </div>
+                )}
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── 월 목표 설정 (YTD 월별 총 목표 1~12월) ──────────────────────────────────────
+function MonthlyGoalTab() {
+  const DEPT = "국내사업팀";
+  const now = new Date();
+  const [year, setYear] = useState(now.getFullYear());
+  const goalsQuery = trpc.targets.getYtdGoals.useQuery({ dept: DEPT, year }, { staleTime: 60_000 });
+  const [inputs, setInputs] = useState<Record<string, string>>({});
+  const seededRef = useRef<string>("");
+
+  useEffect(() => {
+    const key = String(year);
+    if (goalsQuery.data && seededRef.current !== key) {
+      const init: Record<string, string> = {};
+      for (let m = 1; m <= 12; m++) {
+        const v = goalsQuery.data[m] ?? 0;
+        init[String(m)] = v > 0 ? String(v) : "";
+      }
+      setInputs(init);
+      seededRef.current = key;
+    }
+  }, [goalsQuery.data, year]);
+
+  const upsert = trpc.targets.upsertYtdGoals.useMutation({
+    onSuccess: () => { toast.success("월 목표가 저장되었습니다"); goalsQuery.refetch(); },
+    onError: () => toast.error("저장에 실패했습니다"),
+  });
+  const save = () => {
+    const goals: Record<string, number> = {};
+    for (let m = 1; m <= 12; m++) goals[String(m)] = parseFloat((inputs[String(m)] || "0").replace(/,/g, "")) || 0;
+    upsert.mutate({ dept: DEPT, year, goals });
+  };
+  const total = Object.values(inputs).reduce((s, v) => s + (parseFloat((v || "0").replace(/,/g, "")) || 0), 0);
+  const MONTHS = ["1월", "2월", "3월", "4월", "5월", "6월", "7월", "8월", "9월", "10월", "11월", "12월"];
+  const years = [now.getFullYear() - 1, now.getFullYear(), now.getFullYear() + 1];
+
+  return (
+    <div className="rounded-xl border border-gray-200 bg-white p-4 space-y-4">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div>
+          <h3 className="text-sm font-semibold text-gray-800">월 목표 설정 (연누계)</h3>
+          <p className="text-xs text-gray-500">매출/수익 분석·월간 리포트의 목표달성률 기준. 각 월의 목표 매출액(원)을 입력하세요.</p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Select value={String(year)} onValueChange={(v) => setYear(Number(v))}>
+            <SelectTrigger className="h-8 w-24 text-xs"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {years.map((y) => <SelectItem key={y} value={String(y)}>{y}년</SelectItem>)}
+            </SelectContent>
+          </Select>
+          <Button size="sm" className="h-8 text-xs" onClick={save} disabled={upsert.isPending}>
+            {upsert.isPending ? "저장 중..." : "저장"}
+          </Button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+        {MONTHS.map((label, idx) => {
+          const m = idx + 1;
+          return (
+            <div key={m} className="space-y-1">
+              <Label className="text-xs text-gray-500">{label}</Label>
+              <Input
+                type="text"
+                inputMode="numeric"
+                placeholder="0"
+                className="h-8 text-xs text-right tabular-nums"
+                value={inputs[String(m)] ? Number(inputs[String(m)]).toLocaleString() : ""}
+                onChange={(e) => setInputs((prev) => ({ ...prev, [String(m)]: e.target.value.replace(/[^\d]/g, "") }))}
+              />
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="flex items-center justify-end gap-2 border-t border-gray-100 pt-3 text-xs">
+        <span className="text-gray-500">연간 전체 목표 합계:</span>
+        <strong className="text-gray-800 tabular-nums">{total.toLocaleString()} 원</strong>
+      </div>
+    </div>
+  );
+}
+
 export default function AdminPage() {
+  const isAdmin = getStoredUser()?.role === "admin";
   return (
     <AppLayout title="데이터 관리자" subtitle="마스터 데이터 편집 및 매출 데이터 관리">
       <div className="space-y-6">
@@ -1246,43 +1509,80 @@ export default function AdminPage() {
         </div>
 
         {/* Tabs */}
-        <Tabs defaultValue="targets" className="space-y-4">
+        <Tabs defaultValue={isAdmin ? "targets" : "password"} className="space-y-4">
           <TabsList className="bg-gray-100 border border-gray-200 h-9 p-1 flex-wrap gap-0.5">
             <TabsTrigger
               value="targets"
-              className="text-xs data-[state=active]:bg-indigo-600 data-[state=active]:text-white text-gray-600 h-7 px-3"
+              disabled={!isAdmin}
+              title={!isAdmin ? "관리자 전용" : undefined}
+              className="text-xs data-[state=active]:bg-indigo-600 data-[state=active]:text-white text-gray-600 h-7 px-3 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <Target className="w-3.5 h-3.5 mr-1.5" />
               월별 목표값
             </TabsTrigger>
             <TabsTrigger
+              value="goals"
+              disabled={!isAdmin}
+              title={!isAdmin ? "관리자 전용" : undefined}
+              className="text-xs data-[state=active]:bg-indigo-600 data-[state=active]:text-white text-gray-600 h-7 px-3 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Target className="w-3.5 h-3.5 mr-1.5" />
+              목표 설정
+            </TabsTrigger>
+            <TabsTrigger
               value="bom"
-              className="text-xs data-[state=active]:bg-indigo-600 data-[state=active]:text-white text-gray-600 h-7 px-3"
+              disabled={!isAdmin}
+              title={!isAdmin ? "관리자 전용" : undefined}
+              className="text-xs data-[state=active]:bg-indigo-600 data-[state=active]:text-white text-gray-600 h-7 px-3 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <Package className="w-3.5 h-3.5 mr-1.5" />
               BOM 원가
             </TabsTrigger>
             <TabsTrigger
               value="sales"
-              className="text-xs data-[state=active]:bg-indigo-600 data-[state=active]:text-white text-gray-600 h-7 px-3"
+              disabled={!isAdmin}
+              title={!isAdmin ? "관리자 전용" : undefined}
+              className="text-xs data-[state=active]:bg-indigo-600 data-[state=active]:text-white text-gray-600 h-7 px-3 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <Database className="w-3.5 h-3.5 mr-1.5" />
               매출 데이터
             </TabsTrigger>
             <TabsTrigger
               value="newproducts"
-              className="text-xs data-[state=active]:bg-violet-600 data-[state=active]:text-white text-gray-600 h-7 px-3"
+              disabled={!isAdmin}
+              title={!isAdmin ? "관리자 전용" : undefined}
+              className="text-xs data-[state=active]:bg-violet-600 data-[state=active]:text-white text-gray-600 h-7 px-3 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <Sparkles className="w-3.5 h-3.5 mr-1.5" />
               신상품 관리
             </TabsTrigger>
             <TabsTrigger
               value="variable"
-              className="text-xs data-[state=active]:bg-indigo-600 data-[state=active]:text-white text-gray-600 h-7 px-3"
+              disabled={!isAdmin}
+              title={!isAdmin ? "관리자 전용" : undefined}
+              className="text-xs data-[state=active]:bg-indigo-600 data-[state=active]:text-white text-gray-600 h-7 px-3 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <TrendingDown className="w-3.5 h-3.5 mr-1.5" />
               월별 변동비
             </TabsTrigger>
+            <TabsTrigger
+              value="team"
+              disabled={!isAdmin}
+              title={!isAdmin ? "관리자 전용" : undefined}
+              className="text-xs data-[state=active]:bg-indigo-600 data-[state=active]:text-white text-gray-600 h-7 px-3 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Users className="w-3.5 h-3.5 mr-1.5" />
+              팀 분류
+            </TabsTrigger>
+            {isAdmin && (
+              <TabsTrigger
+                value="accounts"
+                className="text-xs data-[state=active]:bg-indigo-600 data-[state=active]:text-white text-gray-600 h-7 px-3"
+              >
+                <ShieldCheck className="w-3.5 h-3.5 mr-1.5" />
+                회원 관리
+              </TabsTrigger>
+            )}
             <TabsTrigger
               value="password"
               className="text-xs data-[state=active]:bg-indigo-600 data-[state=active]:text-white text-gray-600 h-7 px-3"
@@ -1294,6 +1594,9 @@ export default function AdminPage() {
 
           <TabsContent value="targets" className="mt-0">
             <TargetsTab />
+          </TabsContent>
+          <TabsContent value="goals" className="mt-0">
+            <MonthlyGoalTab />
           </TabsContent>
           <TabsContent value="bom" className="mt-0">
             <BomCostsTab />
@@ -1307,6 +1610,14 @@ export default function AdminPage() {
           <TabsContent value="variable" className="mt-0">
             <VariableCostsTab />
           </TabsContent>
+          <TabsContent value="team" className="mt-0">
+            <TeamMapTab />
+          </TabsContent>
+          {isAdmin && (
+            <TabsContent value="accounts" className="mt-0">
+              <AccountsTab />
+            </TabsContent>
+          )}
           <TabsContent value="password" className="mt-0">
             <PasswordTab />
           </TabsContent>

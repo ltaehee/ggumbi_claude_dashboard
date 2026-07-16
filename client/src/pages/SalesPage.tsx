@@ -2,6 +2,7 @@ import React, { useState, useMemo, useEffect, useRef } from "react";
 import { useLocation } from "wouter";
 import { AppLayout } from "@/components/AppLayout";
 import { DateRangeFilter } from "@/components/DateRangeFilter";
+import { TeamToggle } from "@/components/TeamToggle";
 import { HierarchyFilter } from "@/components/HierarchyFilter";
 import { KpiSection } from "@/components/KpiCards";
 import { DeltaBadge } from "@/components/DeltaBadge";
@@ -13,22 +14,24 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { ChevronRight, ChevronDown, Zap, X, Sparkles, Save, RefreshCw } from "lucide-react";
+import { ChevronRight, ChevronDown, Zap, X, Sparkles, Save, RefreshCw, Search } from "lucide-react";
 import { Textarea } from "@/components/ui/textarea";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
-  AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
+  AreaChart, Area, Bar, PieChart, Pie, Cell,
   ComposedChart, Line,
   XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
   LabelList,
 } from "recharts";
 import { cn } from "@/lib/utils";
+import { Tooltip as UiTooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
+import { TruncatedText } from "@/components/TruncatedText";
 
 const CHART_COLORS = ["#6366f1","#22d3ee","#4ade80","#fb923c","#f472b6","#a78bfa","#34d399","#fbbf24"];
 
-function CustomTooltip({ active, payload, label }: any) {
+function CustomTooltip({ active, payload, label, groupBy }: any) {
   if (!active || !payload?.length) return null;
   // payload에서 pctChange(전기 대비 증감률) 찾기
   const salesPayload = payload.find((p: any) => p.dataKey === "totalSales");
@@ -42,6 +45,18 @@ function CustomTooltip({ active, payload, label }: any) {
     ? (() => {
         const toDate = (v: string | Date) => (v instanceof Date ? v : new Date(v));
         const fmt = (v: string | Date) => { const d = toDate(v); return `${d.getMonth()+1}/${d.getDate()}`; };
+        // 일단위: 해당 날짜(연도 포함) 표시
+        if (groupBy === "day") {
+          const d = toDate(minDate);
+          return `${d.getFullYear()}년 ${d.getMonth() + 1}월 ${d.getDate()}일`;
+        }
+        // 월단위: 실제 데이터 날짜가 아니라 해당 월 전체(1일~말일)로 표시
+        if (groupBy === "yearMonth") {
+          const d = toDate(minDate);
+          const first = new Date(d.getFullYear(), d.getMonth(), 1);
+          const last = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+          return `${fmt(first)} ~ ${fmt(last)}`;
+        }
         const dayKey = (v: string | Date) => toDate(v).toDateString();
         return dayKey(minDate) === dayKey(maxDate) ? fmt(minDate) : `${fmt(minDate)}~${fmt(maxDate)}`;
       })()
@@ -113,7 +128,8 @@ function PieCustomLabel({ cx, cy, midAngle, innerRadius, outerRadius, percent, n
   const displayName = name && name.length > 8 ? name.slice(0, 8) + "…" : (name ?? "");
 
   return (
-    <g>
+    // pointerEvents none: 라벨/연결선이 마우스를 가로채지 않게 → 조각 hover 툴팁 정상 작동
+    <g style={{ pointerEvents: "none" }}>
       {/* 퍼센트 - 내부 흰색 */}
       <text x={ix} y={iy} fill="white" textAnchor="middle" dominantBaseline="central"
         style={{ fontSize: percent >= 0.08 ? 12 : 10, fontWeight: 700, textShadow: "0 1px 2px rgba(0,0,0,0.4)" }}>
@@ -332,8 +348,9 @@ function QuickChipFilter({
               {(newProductNamesQuery.data ?? []).map((name, i) => {
                 const isSelected = filters.itemNames.includes(name);
                 return (
+                  <UiTooltip key={name}>
+                    <TooltipTrigger asChild>
                   <button
-                    key={name}
                     onClick={() => {
                       if (isSelected) {
                         setItemNames(filters.itemNames.filter((n) => n !== name));
@@ -371,6 +388,11 @@ function QuickChipFilter({
                       </span>
                     )}
                   </button>
+                    </TooltipTrigger>
+                    <TooltipContent side="top" className="max-w-xs break-words whitespace-normal">
+                      {name}
+                    </TooltipContent>
+                  </UiTooltip>
                 );
               })}
             </div>
@@ -388,8 +410,9 @@ function QuickChipFilter({
           : items.map((item, i) => {
               const isActive = activeSet.includes(item.label);
               return (
+                <UiTooltip key={item.label}>
+                  <TooltipTrigger asChild>
                 <button
-                  key={item.label}
                   onClick={() => toggleChip(item.label)}
                   className={cn(
                     "inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] font-medium border transition-all duration-150",
@@ -415,6 +438,11 @@ function QuickChipFilter({
                     {fmtAmt(item.totalSales)}
                   </span>
                 </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="top" className="max-w-xs break-words whitespace-normal">
+                    {item.label}
+                  </TooltipContent>
+                </UiTooltip>
               );
             })}
       </div>
@@ -428,10 +456,43 @@ const MONTH_LABELS = ["1월","2월","3월","4월","5월","6월","7월","8월","9
 // ─── 메인 페이지 ─────────────────────────────────────────────────────────────
 export default function SalesPage() {
   const [perfGroupBy, setPerfGroupBy] = useState<"channel" | "itemName" | "itemLarge" | "itemMid" | "itemSmall">("channel");
+  // 성과 상세 정렬 (컬럼 클릭 오/내림차순)
+  const [perfSort, setPerfSort] = useState<{ key: string; dir: "asc" | "desc" }>({ key: "totalSales", dir: "desc" });
+  const [perfSearch, setPerfSearch] = useState(""); // 성과 상세 테이블 검색어
+  const [perfSuggestOpen, setPerfSuggestOpen] = useState(false); // 검색 자동완성 드롭다운
   const [activeChipTab, setActiveChipTab] = useState<ChipType | "newProduct">("channel");
-  const { filters, setDateFilter } = useFilters();
+  const { filters, setDateFilter, setTeam } = useFilters();
+
+  // 채널 필터를 걸면 성과 상세 테이블을 품명별로 자동 전환 (그 채널의 상품 구성 확인)
+  const channelKey = filters.channels.join("|");
+  useEffect(() => {
+    if (filters.channels.length > 0) setPerfGroupBy("itemName");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [channelKey]);
   const filter = filters.dateFilter;
   const dept = "국내사업팀";
+
+  // 품명/상품군(대·중·소분류·품명) 필터가 걸리면 월 전체 목표는 맞지 않으므로 목표 막대를 숨김
+  const hasItemFilter =
+    filters.itemLarges.length > 0 ||
+    filters.itemMids.length > 0 ||
+    filters.itemSmalls.length > 0 ||
+    filters.itemNames.length > 0 ||
+    filters.manager !== "" ||
+    filters.team !== "";
+  const showMonthTarget = (filter.mode === "month" || filter.mode === "custom") && !hasItemFilter;
+
+  // 담당/팀 필터: 서버에서 담당 품명으로 변환 (targetYear = 목표가 등록된 최신 연도)
+  // 담당이 팀보다 구체적이라 담당 우선
+  const targetYearQ = trpc.productTargets.getYears.useQuery();
+  const targetYear = targetYearQ.data?.[0];
+  const targetScope = targetYear
+    ? filters.manager
+      ? { manager: filters.manager, targetYear }
+      : filters.team
+      ? { team: filters.team, targetYear }
+      : {}
+    : {};
 
   const kpiQuery = trpc.kpi.getSummary.useQuery({
     startDate: filter.startDate,
@@ -442,10 +503,12 @@ export default function SalesPage() {
     itemMids: filters.itemMids.length > 0 ? filters.itemMids : undefined,
     itemSmalls: filters.itemSmalls.length > 0 ? filters.itemSmalls : undefined,
     itemNames: filters.itemNames.length > 0 ? filters.itemNames : undefined,
+    ...targetScope,
   });
 
   const trendGroupBy = useMemo(() => {
     if (filter.mode === "month") return "yearMonth" as const;
+    if (filter.mode === "day") return "day" as const;
     return "weekLabel" as const;
   }, [filter.mode]);
 
@@ -453,6 +516,12 @@ export default function SalesPage() {
     // 특정기간: 사용자가 직접 고른 범위를 그대로 사용
     if (filter.mode === "custom") {
       return filter.startDate;
+    }
+    // 일단위: 최근 30일 일별 추세 (선택한 날이 마지막 지점)
+    if (filter.mode === "day") {
+      const d = new Date(filter.startDate);
+      d.setDate(d.getDate() - 29);
+      return d.toISOString().split("T")[0];
     }
     // 주간: 최근 약 6개월(≈26주) 추세를 보여줌 (선택한 주가 마지막 지점)
     // 월단위: 최근 12개월 추세
@@ -472,6 +541,7 @@ export default function SalesPage() {
     itemMids: filters.itemMids.length > 0 ? filters.itemMids : undefined,
     itemSmalls: filters.itemSmalls.length > 0 ? filters.itemSmalls : undefined,
     itemNames: filters.itemNames.length > 0 ? filters.itemNames : undefined,
+    ...targetScope,
   });
 
   const perfQuery = trpc.sales.getItemPerf.useQuery({
@@ -479,23 +549,69 @@ export default function SalesPage() {
     endDate: filter.endDate,
     dept,
     groupBy: perfGroupBy,
-    limit: 20,
+    limit: 1000,
     channels: filters.channels.length > 0 ? filters.channels : undefined,
     itemLarges: filters.itemLarges.length > 0 ? filters.itemLarges : undefined,
     itemMids: filters.itemMids.length > 0 ? filters.itemMids : undefined,
     itemSmalls: filters.itemSmalls.length > 0 ? filters.itemSmalls : undefined,
     itemNames: filters.itemNames.length > 0 ? filters.itemNames : undefined,
+    ...targetScope,
   });
 
-  const top10 = useMemo(() => {
-    if (!perfQuery.data) return [];
-    return [...perfQuery.data].sort((a, b) => b.totalSales - a.totalSales).slice(0, 10);
-  }, [perfQuery.data]);
 
   const pieData = useMemo(() => {
     if (!perfQuery.data) return [];
     return perfQuery.data.slice(0, 8).map((r) => ({ name: r.label, value: r.totalSales }));
   }, [perfQuery.data]);
+
+  // 성과 상세 테이블: 검색어 필터 + 컬럼별 정렬
+  const perfRows = useMemo(() => {
+    const data = perfQuery.data ?? [];
+    const q = perfSearch.trim().toLowerCase();
+    const filtered = q ? data.filter((r) => (r.label ?? "").toLowerCase().includes(q)) : [...data];
+    const { key, dir } = perfSort;
+    filtered.sort((a: any, b: any) => {
+      if (key === "label") {
+        const r = String(a.label ?? "").localeCompare(String(b.label ?? ""));
+        return dir === "asc" ? r : -r;
+      }
+      const av = a[key], bv = b[key];
+      const an = av == null || isNaN(av) ? null : av;
+      const bn = bv == null || isNaN(bv) ? null : bv;
+      if (an == null && bn == null) return 0;
+      if (an == null) return 1; // 값 없음은 항상 아래로
+      if (bn == null) return -1;
+      return dir === "asc" ? an - bn : bn - an;
+    });
+    return filtered;
+  }, [perfQuery.data, perfSearch, perfSort]);
+
+  // 정렬 가능한 헤더 셀 (클릭 시 내림→오름 토글)
+  const sortTh = (label: string, key: string, align: "left" | "right" = "right") => {
+    const active = perfSort.key === key;
+    const arrow = active ? (perfSort.dir === "desc" ? "▼" : "▲") : "⇅";
+    return (
+      <th
+        onClick={() => setPerfSort((s) => (s.key === key ? { key, dir: s.dir === "desc" ? "asc" : "desc" } : { key, dir: "desc" }))}
+        className={cn(
+          "px-4 py-2.5 cursor-pointer select-none whitespace-nowrap hover:bg-muted/70 transition-colors",
+          align === "left" ? "text-left" : "text-right",
+          active && "text-foreground font-semibold"
+        )}
+      >
+        {label} <span className={cn("text-[9px]", active ? "text-primary" : "text-muted-foreground/40")}>{arrow}</span>
+      </th>
+    );
+  };
+
+  // 검색 자동완성 미리보기 후보 (최대 8개)
+  const perfSuggestions = useMemo(() => {
+    const q = perfSearch.trim().toLowerCase();
+    if (!q) return [];
+    return (perfQuery.data ?? [])
+      .filter((r) => (r.label ?? "").toLowerCase().includes(q))
+      .slice(0, 8);
+  }, [perfQuery.data, perfSearch]);
 
   const trendData = useMemo(() => {
     if (!trendQuery.data) return [];
@@ -524,23 +640,15 @@ export default function SalesPage() {
     itemMids: filters.itemMids.length > 0 ? filters.itemMids : undefined,
     itemSmalls: filters.itemSmalls.length > 0 ? filters.itemSmalls : undefined,
     itemNames: filters.itemNames.length > 0 ? filters.itemNames : undefined,
+    ...targetScope,
   });
 
-  // ─── YTD 목표 설정 모달 ──────────────────────────────────────────────────────
-  const [goalModalOpen, setGoalModalOpen] = useState(false);
-  const [goalInputs, setGoalInputs] = useState<Record<string, string>>({});
+  // ─── YTD 목표 (읽기 전용 — 설정은 데이터 관리자 > 목표 설정) ─────────────────────
   const goalYear = useMemo(() => new Date(filter.endDate).getFullYear(), [filter.endDate]);
-
   const ytdGoalsQuery = trpc.targets.getYtdGoals.useQuery(
     { dept: dept ?? "all", year: goalYear },
     { staleTime: 60_000 }
   );
-  const upsertYtdGoals = trpc.targets.upsertYtdGoals.useMutation({
-    onSuccess: () => {
-      ytdGoalsQuery.refetch();
-      setGoalModalOpen(false);
-    },
-  });
 
   // 해당 연도 전체 목표 (1월~12월 합산)
   const yearTotalTarget = useMemo(() => {
@@ -569,26 +677,6 @@ export default function SalesPage() {
     return v > 0 ? v : undefined;
   }, [ytdGoalsQuery.data, filter.endDate]);
 
-  const openGoalModal = () => {
-    const init: Record<string, string> = {};
-    for (let m = 1; m <= 12; m++) {
-      const v = ytdGoalsQuery.data?.[m] ?? 0;
-      init[String(m)] = v > 0 ? String(v) : "";
-    }
-    setGoalInputs(init);
-    setGoalModalOpen(true);
-  };
-
-  const saveGoals = () => {
-    const goals: Record<string, number> = {};
-    for (let m = 1; m <= 12; m++) {
-      goals[String(m)] = parseFloat(goalInputs[String(m)]?.replace(/,/g, "") || "0") || 0;
-    }
-    upsertYtdGoals.mutate({ dept: dept ?? "all", year: goalYear, goals });
-  };
-
-  const isNewProductMode = activeChipTab === "newProduct";
-
   // 실제 매출 데이터의 최신 판매일자 조회
   const salesRangeQuery = trpc.dashboard.getSalesRange.useQuery(undefined, { staleTime: 300_000 });
   const actualEndDate = useMemo(() => {
@@ -603,7 +691,6 @@ export default function SalesPage() {
     <AppLayout
       title="매출/수익 분석"
       subtitle={`주피미 · 기간별 매출 성과 분석 · ${filter.startDate} ~ ${actualEndDate}`}
-      mainClassName={isNewProductMode ? "bg-teal-50 dark:bg-teal-900/20" : undefined}
       actions={
         <div className="flex items-center gap-2 flex-wrap">
           <DateRangeFilter value={filter} onChange={setDateFilter} />
@@ -611,6 +698,9 @@ export default function SalesPage() {
       }
     >
       <div className="space-y-5">
+        {/* 팀 선택 (원클릭) — 월간 리포트와 동일 */}
+        <TeamToggle value={filters.team} onChange={setTeam} />
+
         {/* 필터 영역 - 퀵칩 + 계층형 필터 통합 (최상단) */}
         <div className="rounded-xl border border-border bg-card/50 px-4 py-3 space-y-3">
           {/* 퀵칩 필터 */}
@@ -631,21 +721,20 @@ export default function SalesPage() {
           kpi={kpiQuery.data as any}
           loading={kpiQuery.isLoading}
           periodLabel={filter.label}
-          ytdTarget={ytdTarget}
-          currMonthTarget={currMonthTarget}
-          yearTotalTarget={yearTotalTarget}
-          onSetGoal={openGoalModal}
+          ytdTarget={hasItemFilter ? undefined : ytdTarget}
+          currMonthTarget={hasItemFilter ? undefined : currMonthTarget}
+          yearTotalTarget={hasItemFilter ? undefined : yearTotalTarget}
         />
 
-        {/* Charts row */}
-        <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
-          {/* Trend chart - ComposedChart with dual Y-axis */}
-          <div className="lg:col-span-3 rounded-xl border border-border bg-card p-4">
+        {/* Charts: 매출 추세(전체폭) 위 → 분류별 비중 아래 세로 배치 */}
+        <div className="space-y-4">
+          {/* Trend chart - ComposedChart with dual Y-axis (전체폭) */}
+          <div className="rounded-xl border border-border bg-card p-4">
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-sm font-semibold text-foreground">매출 추세</h3>
               <div className="flex items-center gap-3 text-[10px] text-muted-foreground">
                 <span className="flex items-center gap-1"><span className="inline-block w-3 h-0.5 bg-indigo-500"></span>매출(선)</span>
-                <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 bg-amber-500/30 border border-amber-500 rounded-sm"></span>목표(막대)</span>
+                {showMonthTarget && <span className="flex items-center gap-1"><span className="inline-block w-3 h-3 bg-amber-500/30 border border-amber-500 rounded-sm"></span>목표(막대)</span>}
                 <span className="flex items-center gap-1"><span className="inline-block w-3 h-0.5 bg-emerald-500"></span>수량(우축)</span>
               </div>
             </div>
@@ -658,7 +747,7 @@ export default function SalesPage() {
                 <ComposedChart data={trendData.map(r => ({
                   ...r,
                   monthTarget: (() => {
-                    if (filter.mode === "week") return undefined;
+                    if (!showMonthTarget) return undefined;
                     const m = new Date(r.minDate).getMonth() + 1;
                     return ytdGoalsQuery.data?.[m] ?? undefined;
                   })(),
@@ -679,8 +768,8 @@ export default function SalesPage() {
                     tickLine={false} axisLine={false}
                     tickFormatter={(v) => v >= 1_000 ? `${(v/1_000).toFixed(0)}K` : String(v)}
                   />
-                  <Tooltip content={<CustomTooltip />} />
-                  {filter.mode !== "week" && <Bar yAxisId="sales" dataKey="monthTarget" name="목표" fill="#f59e0b" fillOpacity={0.5} radius={[3,3,0,0]} />}
+                  <Tooltip content={(props: any) => <CustomTooltip {...props} groupBy={trendGroupBy} />} />
+                  {showMonthTarget && <Bar yAxisId="sales" dataKey="monthTarget" name="목표" fill="#f59e0b" fillOpacity={0.5} radius={[3,3,0,0]} />}
                   <Line yAxisId="sales" type="monotone" dataKey="totalSales" name="매출" stroke="#6366f1" strokeWidth={2} dot={{ r: 3, fill: "#6366f1" }} activeDot={{ r: 5 }} />
                   <Line yAxisId="qty" type="monotone" dataKey="totalQty" name="수량" stroke="#10b981" strokeWidth={1.5} dot={false} activeDot={{ r: 3 }} strokeDasharray="4 2" />
                 </ComposedChart>
@@ -690,8 +779,8 @@ export default function SalesPage() {
             )}
           </div>
 
-          {/* Pie chart - 확대 + 라벨 표시 */}
-          <div className="lg:col-span-2 rounded-xl border border-border bg-card p-4">
+          {/* Pie chart - 확대 + 라벨 표시 (매출 추세 아래로 이동) */}
+          <div className="rounded-xl border border-border bg-card p-4">
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-sm font-semibold text-foreground">분류별 비중</h3>
               <Select value={perfGroupBy} onValueChange={(v) => setPerfGroupBy(v as any)}>
@@ -709,14 +798,14 @@ export default function SalesPage() {
               <Skeleton className="h-80 w-full" />
             ) : (
               <div>
-                <ResponsiveContainer width="100%" height={320}>
+                <ResponsiveContainer width="100%" height={380}>
                   <PieChart margin={{ top: 30, right: 60, bottom: 30, left: 60 }}>
                     <Pie
                       data={pieData}
                       cx="50%"
                       cy="50%"
-                      innerRadius={60}
-                      outerRadius={105}
+                      innerRadius={72}
+                      outerRadius={125}
                       paddingAngle={2}
                       dataKey="value"
                       labelLine={false}
@@ -760,48 +849,14 @@ export default function SalesPage() {
           kpiData={kpiQuery.data}
         />
 
-        {/* TOP 10 bar chart */}
-        <div className="rounded-xl border border-border bg-card p-4">
-          <div className="flex items-center justify-between mb-4">
-            <h3 className="text-sm font-semibold text-foreground">
-              {perfGroupBy === "channel" ? "거래처" : perfGroupBy === "itemName" ? "품명" : perfGroupBy === "itemLarge" ? "대분류" : perfGroupBy === "itemSmall" ? "소분류" : "중분류"} TOP 10
-            </h3>
-            <Select value={perfGroupBy} onValueChange={(v) => setPerfGroupBy(v as any)}>
-              <SelectTrigger className="h-7 text-xs w-28"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="channel">거래처별</SelectItem>
-                <SelectItem value="itemName">품명별</SelectItem>
-                <SelectItem value="itemLarge">대분류별</SelectItem>
-                <SelectItem value="itemMid">중분류별</SelectItem>
-                <SelectItem value="itemSmall">소분류별</SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
-          {perfQuery.isLoading ? (
-            <Skeleton className="h-48 w-full" />
-          ) : (
-            <div className="overflow-x-auto">
-            <div style={{ minWidth: Math.max(400, top10.length * 40) }}>
-            <ResponsiveContainer width="100%" height={Math.max(180, top10.length * 28)}>
-              <BarChart data={top10} layout="vertical" margin={{ top: 0, right: 40, left: 0, bottom: 0 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" horizontal={false} />
-                <XAxis type="number" tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} tickLine={false} axisLine={false} tickFormatter={(v) => v >= 1_000_000 ? `${(v/1_000_000).toFixed(0)}M` : v >= 1_000 ? `${(v/1_000).toFixed(0)}K` : String(v)} />
-                <YAxis type="category" dataKey="label" tick={{ fontSize: 10, fill: "var(--muted-foreground)" }} tickLine={false} axisLine={false} width={110} />
-                <Tooltip formatter={(v: number) => [fmtAmt(v), "매출"]} contentStyle={{ fontSize: 11, borderRadius: 8, border: "1px solid var(--border)", background: "var(--popover)" }} />
-                <Bar dataKey="totalSales" name="매출" fill="#6366f1" radius={[0, 4, 4, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-            </div>
-            </div>
-          )}
-        </div>
-
         {/* 개별 상품 비교 트렌드 라인 그래프 */}
         <div className="rounded-xl border border-border bg-card p-4">
           <div className="flex items-center justify-between mb-4">
             <div>
-              <h3 className="text-sm font-semibold text-foreground">개별 상품 추세 비교</h3>
-              <p className="text-[11px] text-muted-foreground mt-0.5">상위 6개 항목의 매출 추세를 개별 라인으로 비교 (위 필터 연동)</p>
+              <h3 className="text-sm font-semibold text-foreground">
+                {itemTrendGroupField === "channel" ? "채널" : itemTrendGroupField === "itemName" ? "품명" : itemTrendGroupField === "itemMid" ? "중분류" : "대분류"} 추세 비교
+              </h3>
+              <p className="text-[11px] text-muted-foreground mt-0.5">상위 6개의 매출 추세를 개별 라인으로 비교 (위 필터 연동)</p>
             </div>
           </div>
           {itemTrendQuery.isLoading ? (
@@ -850,32 +905,63 @@ export default function SalesPage() {
 
         {/* 성과 상세 테이블 (기존) */}
         <div className="rounded-xl border border-border bg-card overflow-hidden">
-          <div className="flex items-center justify-between p-4 border-b border-border">
-            <h3 className="text-sm font-semibold text-foreground">성과 상세 테이블</h3>
-            <Select value={perfGroupBy} onValueChange={(v) => setPerfGroupBy(v as any)}>
-              <SelectTrigger className="h-7 text-xs w-28"><SelectValue /></SelectTrigger>
-              <SelectContent>
-                <SelectItem value="channel">거래처별</SelectItem>
-                <SelectItem value="itemName">품명별</SelectItem>
-                <SelectItem value="itemLarge">대분류별</SelectItem>
-                <SelectItem value="itemMid">중분류별</SelectItem>
-                <SelectItem value="itemSmall">소분류별</SelectItem>
-              </SelectContent>
-            </Select>
+          <div className="flex items-center justify-between gap-2 p-4 border-b border-border flex-wrap">
+            <div className="flex items-center gap-2">
+              <h3 className="text-sm font-semibold text-foreground">성과 상세 테이블</h3>
+              <span className="text-[11px] text-muted-foreground">{perfRows.length}건</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="relative">
+                <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground pointer-events-none z-10" />
+                <Input
+                  value={perfSearch}
+                  onChange={(e) => { setPerfSearch(e.target.value); setPerfSuggestOpen(true); }}
+                  onFocus={() => setPerfSuggestOpen(true)}
+                  onBlur={() => setTimeout(() => setPerfSuggestOpen(false), 150)}
+                  placeholder="검색..."
+                  className="h-7 text-xs w-44 pl-7"
+                />
+                {perfSuggestOpen && perfSuggestions.length > 0 && (
+                  <div className="absolute right-0 z-50 mt-1 w-56 max-h-64 overflow-y-auto rounded-md border border-border bg-popover shadow-lg">
+                    {perfSuggestions.map((s) => (
+                      <button
+                        key={s.label}
+                        type="button"
+                        onMouseDown={(e) => { e.preventDefault(); setPerfSearch(s.label); setPerfSuggestOpen(false); }}
+                        className="flex items-center justify-between gap-2 w-full px-3 py-1.5 text-left text-xs hover:bg-accent transition-colors"
+                      >
+                        <TruncatedText text={s.label} side="left" className="min-w-0 flex-1" />
+                        <span className="text-[10px] text-muted-foreground tabular-nums shrink-0">{fmtAmt(s.totalSales)}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <Select value={perfGroupBy} onValueChange={(v) => setPerfGroupBy(v as any)}>
+                <SelectTrigger className="h-7 text-xs w-28"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="channel">거래처별</SelectItem>
+                  <SelectItem value="itemName">품명별</SelectItem>
+                  <SelectItem value="itemLarge">대분류별</SelectItem>
+                  <SelectItem value="itemMid">중분류별</SelectItem>
+                  <SelectItem value="itemSmall">소분류별</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
           </div>
-          <div className="overflow-x-auto">
+          <div className="overflow-auto h-[480px]">
             <table className="w-full data-table">
-              <thead>
-                <tr className="border-b border-border bg-muted/30">
-                  <th className="text-left px-4 py-2.5">구분</th>
-                  <th className="text-right px-4 py-2.5">매출</th>
-                  <th className="text-right px-4 py-2.5">수량</th>
-                  <th className="text-right px-4 py-2.5">이익</th>
-                  <th className="text-right px-4 py-2.5">이익률</th>
-                  <th className="text-right px-4 py-2.5">공헌이익</th>
-                  <th className="text-right px-4 py-2.5">공헌이익률</th>
-                  <th className="text-right px-4 py-2.5">YoY</th>
-                  <th className="text-right px-4 py-2.5">MoM</th>
+              <thead className="sticky top-0 z-10">
+                <tr className="border-b border-border bg-muted">
+                  {sortTh("구분", "label", "left")}
+                  {sortTh("매출", "totalSales")}
+                  {sortTh("수량", "totalQty")}
+                  {sortTh("이익", "totalProfit")}
+                  {sortTh("이익률", "marginRate")}
+                  {sortTh("공헌이익", "contribMargin")}
+                  {sortTh("공헌이익률", "contribMarginRate")}
+                  {sortTh("전년대비", "yoyPct")}
+                  {sortTh("전월대비", "momPct")}
                 </tr>
               </thead>
               <tbody>
@@ -887,7 +973,7 @@ export default function SalesPage() {
                         ))}
                       </tr>
                     ))
-                  : (perfQuery.data ?? []).map((row, i) => (
+                  : perfRows.map((row, i) => (
                       <tr key={i} className={cn(
                         "border-b border-border/50 hover:bg-muted/30 transition-colors",
                         i % 2 === 0 ? "bg-background" : "bg-muted/10"
@@ -932,15 +1018,17 @@ export default function SalesPage() {
                             <span className="text-muted-foreground text-xs">입력 필요</span>
                           )}
                         </td>
-                        <td className="px-4 py-2.5 text-right"><DeltaBadge value={row.yoyPct} /></td>
-                        <td className="px-4 py-2.5 text-right"><DeltaBadge value={row.momPct} /></td>
+                        <td className="px-4 py-2.5 text-right"><DeltaBadge value={row.yoyPct} unit="%" /></td>
+                        <td className="px-4 py-2.5 text-right"><DeltaBadge value={row.momPct} unit="%" /></td>
                       </tr>
                     ))}
               </tbody>
             </table>
-            {!perfQuery.isLoading && (perfQuery.data?.length ?? 0) === 0 && (
+            {!perfQuery.isLoading && perfRows.length === 0 && (
               <div className="text-center py-12 text-muted-foreground text-sm">
-                데이터가 없습니다. 엑셀 파일을 업로드해주세요.
+                {(perfQuery.data?.length ?? 0) === 0
+                  ? "데이터가 없습니다. 엑셀 파일을 업로드해주세요."
+                  : `"${perfSearch}" 검색 결과가 없습니다.`}
               </div>
             )}
           </div>
@@ -948,41 +1036,6 @@ export default function SalesPage() {
 
       </div>
 
-      {/* YTD 목표 설정 모달 */}
-      <Dialog open={goalModalOpen} onOpenChange={setGoalModalOpen}>
-        <DialogContent className="max-w-lg">
-          <DialogHeader>
-            <DialogTitle>{goalYear}년 월별 YTD 목표 설정</DialogTitle>
-          </DialogHeader>
-          <div className="grid grid-cols-3 gap-3 py-2">
-            {MONTH_LABELS.map((label, idx) => {
-              const m = idx + 1;
-              return (
-                <div key={m} className="space-y-1">
-                  <Label className="text-xs text-muted-foreground">{label}</Label>
-                  <Input
-                    type="number"
-                    min={0}
-                    placeholder="0"
-                    className="h-8 text-xs"
-                    value={goalInputs[String(m)] ?? ""}
-                    onChange={(e) =>
-                      setGoalInputs((prev) => ({ ...prev, [String(m)]: e.target.value }))
-                    }
-                  />
-                </div>
-              );
-            })}
-          </div>
-          <p className="text-xs text-muted-foreground">단위: 원. 각 월의 목표 매출액을 입력하세요.</p>
-          <DialogFooter>
-            <Button variant="outline" onClick={() => setGoalModalOpen(false)}>취소</Button>
-            <Button onClick={saveGoals} disabled={upsertYtdGoals.isPending}>
-              {upsertYtdGoals.isPending ? "저장 중..." : "저장"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
     </AppLayout>
   );
 }

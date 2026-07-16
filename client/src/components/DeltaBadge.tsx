@@ -1,14 +1,15 @@
 import { cn } from "@/lib/utils";
-import { deltaClass, deltaIcon, fmtPct } from "@/lib/format";
+import { deltaClass, deltaIcon } from "@/lib/format";
 
 interface DeltaBadgeProps {
   value: number | null | undefined;
   label?: string;
   size?: "xs" | "sm" | "md";
   className?: string;
+  unit?: string; // 표기 단위 (기본 "%", 퍼센트포인트는 "%p")
 }
 
-export function DeltaBadge({ value, label, size = "sm", className }: DeltaBadgeProps) {
+export function DeltaBadge({ value, label, size = "sm", className, unit = "%" }: DeltaBadgeProps) {
   // 비교군 없음 (null)
   if (value == null) {
     return (
@@ -27,7 +28,7 @@ export function DeltaBadge({ value, label, size = "sm", className }: DeltaBadgeP
 
   const cls = deltaClass(value);
   const icon = deltaIcon(value);
-  const pct = fmtPct(value);
+  const pct = `${value >= 0 ? "+" : ""}${value.toFixed(1)}${unit}`;
 
   return (
     <span

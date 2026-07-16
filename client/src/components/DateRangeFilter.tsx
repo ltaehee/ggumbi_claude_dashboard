@@ -11,11 +11,12 @@ import {
   startOfMonth, endOfMonth,
   subWeeks, addWeeks,
   subMonths, addMonths,
+  subDays, addDays,
 } from "date-fns";
 import { ko } from "date-fns/locale";
 import type { DateRange } from "react-day-picker";
 
-export type FilterMode = "custom" | "week" | "month";
+export type FilterMode = "custom" | "week" | "month" | "day";
 
 export interface DateFilter {
   mode: FilterMode;
@@ -32,6 +33,15 @@ interface DateRangeFilterProps {
 
 function toStr(d: Date): string {
   return format(d, "yyyy-MM-dd");
+}
+
+function buildDayFilter(base: Date): DateFilter {
+  return {
+    mode: "day",
+    startDate: toStr(base),
+    endDate: toStr(base),
+    label: format(base, "M월 d일 (eee)", { locale: ko }),
+  };
 }
 
 function buildWeekFilter(base: Date): DateFilter {
@@ -70,11 +80,13 @@ export function DateRangeFilter({ value, onChange, className }: DateRangeFilterP
     return undefined;
   });
   const [calOpen, setCalOpen] = useState(false);
+  const [dayCalOpen, setDayCalOpen] = useState(false);
 
   const handleModeChange = useCallback(
     (mode: FilterMode) => {
       const now = new Date();
-      if (mode === "week") onChange(buildWeekFilter(now));
+      if (mode === "day") onChange(buildDayFilter(now));
+      else if (mode === "week") onChange(buildWeekFilter(now));
       else if (mode === "month") onChange(buildMonthFilter(now));
       else {
         // custom: default to last 30 days
@@ -96,23 +108,17 @@ export function DateRangeFilter({ value, onChange, className }: DateRangeFilterP
   );
 
   const handlePrev = useCallback(() => {
-    if (value.mode === "week") {
-      const base = new Date(value.startDate);
-      onChange(buildWeekFilter(subWeeks(base, 1)));
-    } else if (value.mode === "month") {
-      const base = new Date(value.startDate);
-      onChange(buildMonthFilter(subMonths(base, 1)));
-    }
+    const base = new Date(value.startDate);
+    if (value.mode === "day") onChange(buildDayFilter(subDays(base, 1)));
+    else if (value.mode === "week") onChange(buildWeekFilter(subWeeks(base, 1)));
+    else if (value.mode === "month") onChange(buildMonthFilter(subMonths(base, 1)));
   }, [value, onChange]);
 
   const handleNext = useCallback(() => {
-    if (value.mode === "week") {
-      const base = new Date(value.startDate);
-      onChange(buildWeekFilter(addWeeks(base, 1)));
-    } else if (value.mode === "month") {
-      const base = new Date(value.startDate);
-      onChange(buildMonthFilter(addMonths(base, 1)));
-    }
+    const base = new Date(value.startDate);
+    if (value.mode === "day") onChange(buildDayFilter(addDays(base, 1)));
+    else if (value.mode === "week") onChange(buildWeekFilter(addWeeks(base, 1)));
+    else if (value.mode === "month") onChange(buildMonthFilter(addMonths(base, 1)));
   }, [value, onChange]);
 
   // 캘린더 선택 변경 - 팝업 닫지 않고 pendingRange만 업데이트
@@ -152,11 +158,17 @@ export function DateRangeFilter({ value, onChange, className }: DateRangeFilterP
     return { value: f.startDate, label: f.label };
   });
 
-  // 최근 24개월 목록
-  const monthOptions = Array.from({ length: 24 }, (_, i) => {
-    const d = subMonths(new Date(), i);
-    return { value: toStr(startOfMonth(d)), label: format(d, "yyyy년 M월") };
-  });
+  // 월 목록: 데이터 시작월(2025년 1월)부터 현재월까지 (그 이전은 데이터 없음)
+  const monthOptions = (() => {
+    const dataStart = startOfMonth(new Date(2025, 0, 1));
+    const opts: { value: string; label: string }[] = [];
+    let d = startOfMonth(new Date());
+    while (d >= dataStart) {
+      opts.push({ value: toStr(d), label: format(d, "yyyy년 M월") });
+      d = subMonths(d, 1);
+    }
+    return opts;
+  })();
 
   const hasFullRange = pendingRange?.from && pendingRange?.to;
 
@@ -164,7 +176,7 @@ export function DateRangeFilter({ value, onChange, className }: DateRangeFilterP
     <div className={cn("flex items-center gap-2 flex-wrap", className)}>
       {/* Mode selector */}
       <div className="flex rounded-lg border border-border overflow-hidden">
-        {(["week", "month", "custom"] as FilterMode[]).map((mode) => (
+        {(["day", "week", "month", "custom"] as FilterMode[]).map((mode) => (
           <button
             key={mode}
             onClick={() => handleModeChange(mode)}
@@ -175,10 +187,44 @@ export function DateRangeFilter({ value, onChange, className }: DateRangeFilterP
                 : "bg-card text-muted-foreground hover:bg-muted"
             )}
           >
-            {mode === "week" ? "주간" : mode === "month" ? "월단위" : "특정기간"}
+            {mode === "day" ? "일단위" : mode === "week" ? "주간" : mode === "month" ? "월단위" : "특정기간"}
           </button>
         ))}
       </div>
+
+      {/* Navigation - 일단위 (이전/다음 + 날짜 선택) */}
+      {value.mode === "day" && (
+        <div className="flex items-center gap-1">
+          <Button variant="outline" size="icon" className="h-8 w-8" onClick={handlePrev}>
+            <ChevronLeft className="h-3.5 w-3.5" />
+          </Button>
+          <Popover open={dayCalOpen} onOpenChange={setDayCalOpen}>
+            <PopoverTrigger asChild>
+              <Button variant="outline" size="sm" className="h-8 text-xs gap-1.5 w-32 justify-center">
+                <CalendarIcon className="h-3.5 w-3.5" />
+                {value.label}
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent className="w-auto p-0" align="start">
+              <Calendar
+                mode="single"
+                selected={new Date(value.startDate)}
+                onSelect={(d) => {
+                  if (d) {
+                    onChange(buildDayFilter(d));
+                    setDayCalOpen(false);
+                  }
+                }}
+                locale={ko}
+                initialFocus
+              />
+            </PopoverContent>
+          </Popover>
+          <Button variant="outline" size="icon" className="h-8 w-8" onClick={handleNext}>
+            <ChevronRight className="h-3.5 w-3.5" />
+          </Button>
+        </div>
+      )}
 
       {/* Navigation - 주간 및 월단위 공통 */}
       {(value.mode === "week" || value.mode === "month") && (

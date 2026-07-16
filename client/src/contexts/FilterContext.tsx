@@ -8,6 +8,8 @@ export interface GlobalFilters {
   itemMids: string[];
   itemSmalls: string[];
   itemNames: string[];
+  manager: string; // 담당자 ("" = 전체), 서버에서 담당 품명으로 변환
+  team: string; // 팀 ("" = 전체), 서버에서 팀 담당 품명으로 변환
   dateFilter: DateFilter;
 }
 
@@ -18,6 +20,8 @@ const DEFAULT_FILTERS: GlobalFilters = {
   itemMids: [],
   itemSmalls: [],
   itemNames: [],
+  manager: "",
+  team: "",
   dateFilter: getDefaultFilter(),
 };
 
@@ -29,6 +33,8 @@ interface FilterContextValue {
   setItemMids: (v: string[]) => void;
   setItemSmalls: (v: string[]) => void;
   setItemNames: (v: string[]) => void;
+  setManager: (v: string) => void;
+  setTeam: (v: string) => void;
   setDateFilter: (v: DateFilter) => void;
   resetFilters: () => void;
   hasActiveFilters: boolean;
@@ -66,6 +72,14 @@ export function FilterProvider({ children }: { children: React.ReactNode }) {
     setFilters((f) => ({ ...f, itemNames: clean(itemNames) }));
   }, []);
 
+  const setManager = useCallback((manager: string) => {
+    setFilters((f) => ({ ...f, manager: manager ?? "" }));
+  }, []);
+
+  const setTeam = useCallback((team: string) => {
+    setFilters((f) => ({ ...f, team: team ?? "" }));
+  }, []);
+
   const setDateFilter = useCallback((dateFilter: DateFilter) => {
     setFilters((f) => ({ ...f, dateFilter }));
   }, []);
@@ -79,7 +93,9 @@ export function FilterProvider({ children }: { children: React.ReactNode }) {
     filters.itemLarges.length > 0 ||
     filters.itemMids.length > 0 ||
     filters.itemSmalls.length > 0 ||
-    filters.itemNames.length > 0;
+    filters.itemNames.length > 0 ||
+    filters.manager !== "" ||
+    filters.team !== "";
 
   return (
     <FilterContext.Provider
@@ -91,6 +107,8 @@ export function FilterProvider({ children }: { children: React.ReactNode }) {
         setItemMids,
         setItemSmalls,
         setItemNames,
+        setManager,
+        setTeam,
         setDateFilter,
         resetFilters,
         hasActiveFilters,

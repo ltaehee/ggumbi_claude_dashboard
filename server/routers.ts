@@ -60,12 +60,65 @@ import {
   deleteVariableCost,
   getContribMarginForPeriod,
   getVariableCostRowsForPeriod,
+  getAccount,
+  createAccount,
+  listAccounts,
+  setAccountApproved,
+  deleteAccount,
+  getProductTargetYears,
+  getManagerMap,
+  getTeamItemNames,
+  getMonthlyTargetSums,
+  getScopedItemNames,
+  getMapManagers,
+  getAllManagers,
+  getUnassignedSkus,
+  getUnassignedSummary,
+  assignSkuManager,
+  applyOverrideToMart,
+  assignSmallManager,
 } from "./db";
 import { calcPctSafe, prevMonthSamePeriod, prevYearSameDate } from "./bizUtils";
 import { invokeLLM } from "./_core/llm";
 import { syncNotionToDb, getNotionLastSyncedAt } from "./notionSync";
 import { withCache, queryCache } from "./cache";
 import { naverRankingRouter } from "./naverRankingRouter";
+
+// 담당/팀 → 담당 품명(itemNames)으로 서버측 변환 (URL 길이 문제 회피 + 정밀 매칭)
+async function applyTargetScope<T extends Record<string, any>>(input: T): Promise<T> {
+  const manager: string | undefined = input.manager;
+  const team: string | undefined = input.team;
+  if (!manager && !team) return input;
+
+  // 담당자/팀 → 담당 품명 목록 (마트에 baked된 manager 기준: 품번 오버라이드→소분류 매핑 해석 결과)
+  let names = await getScopedItemNames({ manager, team }).catch(() => [] as string[]);
+
+  // 폴백: 마트에 담당자 정보가 아직 없으면(담당 파일 업로드 전) product_targets 품명 스코핑
+  if (names.length === 0) {
+    const year: number = input.targetYear ?? new Date(input.endDate ?? Date.now()).getFullYear();
+    if (manager) {
+      const mm = await getManagerMap(year).catch(() => []);
+      names = mm.find((x) => x.manager === manager)?.itemNames ?? [];
+    } else if (team) {
+      names = await getTeamItemNames(year, team).catch(() => []);
+    }
+  }
+  if (names.length === 0) names = ["__none__"]; // 매칭 없음 → 빈 결과 유도
+  const existing: string[] | undefined = input.itemNames;
+  const merged = existing && existing.length ? existing.filter((n) => names.includes(n)) : names;
+  return { ...input, itemNames: merged.length ? merged : ["__none__"] };
+}
+
+/** 팀 → 집계 필터 (마트 baked manager 기준 담당 품명). 월간 리포트용 */
+async function teamScopeFilt(
+  year: number,
+  team?: string | null
+): Promise<{ itemNames?: string[] }> {
+  if (!team) return {};
+  let names = await getScopedItemNames({ team }).catch(() => [] as string[]);
+  if (names.length === 0) names = await getTeamItemNames(year, team).catch(() => []);
+  return { itemNames: names.length ? names : ["__none__"] };
+}
 
 export const appRouter = router({
   system: systemRouter,
@@ -104,16 +157,27 @@ export const appRouter = router({
           itemMids: z.array(z.string()).optional(),
           itemSmalls: z.array(z.string()).optional(),
           itemNames: z.array(z.string()).optional(),
+          // 담당/팀 필터 (서버에서 담당 품명으로 변환)
+          manager: z.string().optional(),
+          team: z.string().optional(),
+          targetYear: z.number().optional(),
         })
       )
       .query(async ({ input }) => {
-        const { startDate, endDate, ...filters } = input;
-        const refDate = new Date(endDate);
-        const refYear = refDate.getFullYear();
-
         const cacheKey = `kpi:${JSON.stringify(input)}`;
         const cached = queryCache.get<any>(cacheKey);
         if (cached) return cached;
+
+        const { startDate, endDate, manager: _m, team: _t, targetYear: _ty, ...filters } = await applyTargetScope(input);
+
+        // 진행 중인 기간 보정: 실제 데이터가 있는 마지막 날짜로 비교 기준일(refDate)을 clamp.
+        // 예) 7월을 선택했지만 데이터가 7/6까지만 있으면, 작년·전월도 같은 1~6일 구간으로 비교
+        //     (그렇지 않으면 6일치 vs 지난달 30일치를 비교해 YoY/MoM이 -80%처럼 왜곡됨)
+        const salesRange = await getSalesRange().catch(() => ({ min: null, max: null }));
+        const maxDataDate = salesRange.max ? String(salesRange.max).slice(0, 10) : null;
+        const effectiveEnd = maxDataDate && maxDataDate < endDate ? maxDataDate : endDate;
+        const refDate = new Date(effectiveEnd);
+        const refYear = refDate.getFullYear();
 
         // 마트 기반 집계 (폴백: 원본 테이블)
         const aggFn = async (p: Parameters<typeof aggregateSalesFromMart>[0]) =>
@@ -161,6 +225,12 @@ export const appRouter = router({
         const contribMargin = await getContribMarginForPeriod({ startDate, endDate, ...filters });
         const contribMarginRate = curr.totalSales > 0 ? (contribMargin / curr.totalSales) * 100 : 0;
 
+        // YTD 공헌이익 (올해 / 작년 동기)
+        const [ytdContrib, ytdPrevContrib] = await Promise.all([
+          getContribMarginForPeriod({ startDate: ytdStart, endDate, ...filters }),
+          getContribMarginForPeriod({ startDate: prevYtdStart, endDate: prevYearEndStr, ...filters }),
+        ]);
+
         const result = {
           // 선택 기간
           currSales: curr.totalSales,
@@ -174,6 +244,11 @@ export const appRouter = router({
           ytdSales: ytd.totalSales,
           ytdPrevSales: ytdPrev.totalSales,
           ytdGrowthPct: calcPctSafe(ytd.totalSales, ytdPrev.totalSales),
+          // YTD 매출이익 / 공헌이익
+          ytdProfit: ytd.totalProfit,
+          ytdPrevProfit: ytdPrev.totalProfit,
+          ytdContrib,
+          ytdPrevContrib,
           // YoY
           yoySales: yoy.totalSales,
           yoyPct: calcPctSafe(curr.totalSales, yoy.totalSales),
@@ -237,17 +312,21 @@ export const appRouter = router({
           startDate: z.string(),
           endDate: z.string(),
           dept: z.string().optional(),
-          groupBy: z.enum(["weekLabel", "yearMonth", "yearStr"]),
+          groupBy: z.enum(["weekLabel", "yearMonth", "yearStr", "day"]),
           channels: z.array(z.string()).optional(),
           itemLarges: z.array(z.string()).optional(),
           itemMids: z.array(z.string()).optional(),
           itemSmalls: z.array(z.string()).optional(),
           itemNames: z.array(z.string()).optional(),
+          manager: z.string().optional(),
+          team: z.string().optional(),
+          targetYear: z.number().optional(),
         })
       )
       .query(async ({ input }) => {
         return withCache(`trend:${JSON.stringify(input)}`, async () => {
-          const rows = await getTrendDataFromMart(input).catch(() => getTrendData(input));
+          const scoped = await applyTargetScope(input);
+          const rows = await getTrendDataFromMart(scoped).catch(() => getTrendData(scoped));
           return rows.map((r, i) => ({
             ...r,
             pctChange: i > 0 ? calcPctSafe(r.totalSales, rows[i - 1].totalSales) : null,
@@ -270,11 +349,15 @@ export const appRouter = router({
           itemMids: z.array(z.string()).optional(),
           itemSmalls: z.array(z.string()).optional(),
           itemNames: z.array(z.string()).optional(),
+          manager: z.string().optional(),
+          team: z.string().optional(),
+          targetYear: z.number().optional(),
         })
       )
       .query(async ({ input }) => {
         return withCache(`itemTrend:${JSON.stringify(input)}`, async () => {
-          return getItemTrendData(input);
+          const scoped = await applyTargetScope(input);
+          return getItemTrendData(scoped);
         });
       }),
 
@@ -291,20 +374,24 @@ export const appRouter = router({
           itemMids: z.array(z.string()).optional(),
           itemSmalls: z.array(z.string()).optional(),
           itemNames: z.array(z.string()).optional(),
+          manager: z.string().optional(),
+          team: z.string().optional(),
+          targetYear: z.number().optional(),
         })
       )
       .query(async ({ input }) => {
         return withCache(`itemPerf:${JSON.stringify(input)}`, async () => {
-        const curr = await getItemPerformanceFromMart(input).catch(() => getItemPerformance(input));
+        const scoped = await applyTargetScope(input);
+        const curr = await getItemPerformanceFromMart(scoped).catch(() => getItemPerformance(scoped));
 
         // 전년 동기 비교
-        const refDate = new Date(input.endDate);
+        const refDate = new Date(scoped.endDate);
         const prevYearEnd = prevYearSameDate(refDate);
-        const prevYearStart = prevYearSameDate(new Date(input.startDate));
+        const prevYearStart = prevYearSameDate(new Date(scoped.startDate));
         const perfFn = async (p: Parameters<typeof getItemPerformanceFromMart>[0]) =>
           getItemPerformanceFromMart(p).catch(() => getItemPerformance(p));
         const prev = await perfFn({
-          ...input,
+          ...scoped,
           startDate: prevYearStart.toISOString().split("T")[0],
           endDate: prevYearEnd.toISOString().split("T")[0],
         });
@@ -313,14 +400,14 @@ export const appRouter = router({
         // 전월 동기간
         const { start: momStart, end: momEnd } = prevMonthSamePeriod(refDate);
         const mom = await perfFn({
-          ...input,
+          ...scoped,
           startDate: momStart.toISOString().split("T")[0],
           endDate: momEnd.toISOString().split("T")[0],
         });
         const momMap = new Map(mom.map((p) => [p.label, p]));
 
         // 변동비율 조회 (forecastPct 우선)
-        const vcRows = await getVariableCostRowsForPeriod(input.startDate, input.endDate);
+        const vcRows = await getVariableCostRowsForPeriod(scoped.startDate, scoped.endDate);
         const rowsWithPct = vcRows.filter((r) => r.forecastPct !== null && r.forecastPct > 0);
         const avgPct = rowsWithPct.length > 0
           ? rowsWithPct.reduce((s, r) => s + (r.forecastPct as number), 0) / rowsWithPct.length
@@ -572,7 +659,9 @@ export const appRouter = router({
         );
 
         const startDate = `${year}-${String(month).padStart(2, "0")}-01`;
-        const endDate = `${year}-${String(month).padStart(2, "0")}-31`;
+        // 해당 월의 실제 마지막 날 (6월=30, 2월=28 등). '-31' 고정 시 무효 날짜로 집계가 0이 되는 버그 방지
+        const lastDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
+        const endDate = `${year}-${String(month).padStart(2, "0")}-${String(lastDay).padStart(2, "0")}`;
         const actual = await aggregateSales({ startDate, endDate, dept });
 
         // 연간 누적
@@ -601,6 +690,359 @@ export const appRouter = router({
             target: parseFloat(String(t.targetAmt ?? "0")),
           })),
         };
+      }),
+  }),
+
+  // ─── 월간 종합 리포트 (월전체 분석 페이지) ──────────────────────────────────────
+  report: router({
+    // 월간 + 연누계 KPI(매출/매출이익/공헌이익) + 월별 막대(전년/올해/목표) 종합
+    getMonthly: publicProcedure
+      .input(z.object({ dept: z.string(), year: z.number(), month: z.number(), team: z.string().optional() }))
+      .query(async ({ input }) => {
+        const { dept, year, month, team } = input;
+        const aggFn = async (p: Parameters<typeof aggregateSalesFromMart>[0]) =>
+          aggregateSalesFromMart(p).catch(() => aggregateSales(p));
+        const contribFn = (p: Parameters<typeof getContribMarginForPeriod>[0]) =>
+          getContribMarginForPeriod(p);
+        const pad = (n: number) => String(n).padStart(2, "0");
+        const rangeOf = (y: number, m: number) => {
+          const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+          return { start: `${y}-${pad(m)}-01`, end: `${y}-${pad(m)}-${pad(last)}` };
+        };
+        const rate = (a: number, b: number) => (b > 0 ? (a / b) * 100 : 0);
+
+        // 팀 필터: 실적은 팀 담당 품명(itemNames)으로, 목표는 팀 월목표로
+        const filt = await teamScopeFilt(year, team);
+        const teamMonthly = team ? await getMonthlyTargetSums(year, { team }) : null;
+
+        // 진행 중인 달 보정: 데이터 최종일까지만 있으면 전년·전월도 같은 '일자'까지만 비교
+        // (예: 7월 데이터가 7/6까지면 작년 7/1~7/6, 전월 6/1~6/6 으로 비교 — YoY/MoM 왜곡 방지)
+        const salesRange = await getSalesRange().catch(() => ({ min: null, max: null }));
+        const maxData = salesRange.max ? String(salesRange.max).slice(0, 10) : null;
+        const curFull = rangeOf(year, month);
+        const inProgress = !!maxData && maxData >= curFull.start && maxData < curFull.end;
+        const cutDay = inProgress && maxData ? new Date(maxData).getUTCDate() : null;
+        const endWithCut = (y: number, m: number) => {
+          const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+          const d = cutDay ? Math.min(cutDay, last) : last;
+          return `${y}-${pad(m)}-${pad(d)}`;
+        };
+
+        // 해당 월 / 전년 동월 / 전월 기간
+        const cur = { start: curFull.start, end: inProgress && maxData ? maxData : curFull.end };
+        const py = { start: `${year - 1}-${pad(month)}-01`, end: endWithCut(year - 1, month) };
+        const pmYear = month === 1 ? year - 1 : year;
+        const pmMonth = month === 1 ? 12 : month - 1;
+        const pm = { start: `${pmYear}-${pad(pmMonth)}-01`, end: endWithCut(pmYear, pmMonth) };
+
+        // 목표: 팀 선택 시 팀 월목표, 아니면 dept+year __total__ 행
+        const targetRows = await getTargetsByDeptYear(dept, year);
+        const totalRows = targetRows.filter((r) => r.itemMid === "__total__");
+        const goal = (m: number) => {
+          if (teamMonthly) return teamMonthly[m - 1] ?? 0;
+          const r = totalRows.find((x) => x.month === m);
+          return r ? parseFloat(String(r.targetAmt ?? "0")) : 0;
+        };
+
+        // 집계 (병렬)
+        const [curAgg, pyAgg, pmAgg, curC, pyC, pmC] = await Promise.all([
+          aggFn({ startDate: cur.start, endDate: cur.end, dept, ...filt }),
+          aggFn({ startDate: py.start, endDate: py.end, dept, ...filt }),
+          aggFn({ startDate: pm.start, endDate: pm.end, dept, ...filt }),
+          contribFn({ startDate: cur.start, endDate: cur.end, dept, ...filt }),
+          contribFn({ startDate: py.start, endDate: py.end, dept, ...filt }),
+          contribFn({ startDate: pm.start, endDate: pm.end, dept, ...filt }),
+        ]);
+
+        // 연누계 (1/1 ~ 해당 월말, 전년 동기 — 진행 중이면 같은 일자까지)
+        const ytdEnd = cur.end;
+        const ytdPyEnd = endWithCut(year - 1, month);
+        const [ytdCur, ytdPy, ytdCurC, ytdPyC] = await Promise.all([
+          aggFn({ startDate: `${year}-01-01`, endDate: ytdEnd, dept, ...filt }),
+          aggFn({ startDate: `${year - 1}-01-01`, endDate: ytdPyEnd, dept, ...filt }),
+          contribFn({ startDate: `${year}-01-01`, endDate: ytdEnd, dept, ...filt }),
+          contribFn({ startDate: `${year - 1}-01-01`, endDate: ytdPyEnd, dept, ...filt }),
+        ]);
+
+        const monthTarget = goal(month);
+        let ytdTarget = 0;
+        for (let m = 1; m <= month; m++) ytdTarget += goal(m);
+
+        // 월별 막대 (전년/올해 매출 + 목표)
+        const [trendCur, trendPrev] = await Promise.all([
+          getTrendDataFromMart({ startDate: `${year}-01-01`, endDate: `${year}-12-31`, dept, groupBy: "yearMonth", ...filt }).catch(() =>
+            getTrendData({ startDate: `${year}-01-01`, endDate: `${year}-12-31`, dept, groupBy: "yearMonth", ...filt })
+          ),
+          getTrendDataFromMart({ startDate: `${year - 1}-01-01`, endDate: `${year - 1}-12-31`, dept, groupBy: "yearMonth", ...filt }).catch(() =>
+            getTrendData({ startDate: `${year - 1}-01-01`, endDate: `${year - 1}-12-31`, dept, groupBy: "yearMonth", ...filt })
+          ),
+        ]);
+        const monthOf = (minDate: string) => new Date(minDate).getUTCMonth() + 1;
+        const curByMonth: Record<number, number> = {};
+        const prevByMonth: Record<number, number> = {};
+        trendCur.forEach((r) => { if (r.minDate) curByMonth[monthOf(r.minDate)] = r.totalSales; });
+        trendPrev.forEach((r) => { if (r.minDate) prevByMonth[monthOf(r.minDate)] = r.totalSales; });
+        const bars = Array.from({ length: 12 }, (_, i) => {
+          const m = i + 1;
+          return { month: m, curr: curByMonth[m] ?? 0, prev: prevByMonth[m] ?? 0, target: goal(m) };
+        });
+
+        return {
+          year,
+          prevYear: year - 1,
+          month,
+          maxDataDate: maxData, // 데이터가 있는 마지막 날짜 (예: '2026-07-06'), 없으면 null
+          inProgress,           // 선택한 달이 진행 중(부분 데이터)인지
+          monthKpi: {
+            sales: {
+              curr: curAgg.totalSales,
+              target: monthTarget,
+              achievePct: rate(curAgg.totalSales, monthTarget),
+              prevYear: pyAgg.totalSales,
+              yoyPct: calcPctSafe(curAgg.totalSales, pyAgg.totalSales),
+              prevMonth: pmAgg.totalSales,
+              momPct: calcPctSafe(curAgg.totalSales, pmAgg.totalSales),
+            },
+            profit: {
+              curr: curAgg.totalProfit,
+              rate: rate(curAgg.totalProfit, curAgg.totalSales),
+              prevYearRate: rate(pyAgg.totalProfit, pyAgg.totalSales),
+              prevYear: pyAgg.totalProfit,
+              prevMonth: pmAgg.totalProfit,
+              yoyPct: calcPctSafe(curAgg.totalProfit, pyAgg.totalProfit),
+              momPct: calcPctSafe(curAgg.totalProfit, pmAgg.totalProfit),
+            },
+            contrib: {
+              curr: curC,
+              rate: rate(curC, curAgg.totalSales),
+              prevYearRate: rate(pyC, pyAgg.totalSales),
+              prevYear: pyC,
+              prevMonth: pmC,
+              yoyPct: calcPctSafe(curC, pyC),
+              momPct: calcPctSafe(curC, pmC),
+            },
+          },
+          ytdKpi: {
+            sales: {
+              curr: ytdCur.totalSales,
+              target: ytdTarget,
+              achievePct: rate(ytdCur.totalSales, ytdTarget),
+              prevYear: ytdPy.totalSales,
+              yoyPct: calcPctSafe(ytdCur.totalSales, ytdPy.totalSales),
+            },
+            profit: {
+              curr: ytdCur.totalProfit,
+              rate: rate(ytdCur.totalProfit, ytdCur.totalSales),
+              prevYearRate: rate(ytdPy.totalProfit, ytdPy.totalSales),
+              prevYear: ytdPy.totalProfit,
+              yoyPct: calcPctSafe(ytdCur.totalProfit, ytdPy.totalProfit),
+            },
+            contrib: {
+              curr: ytdCurC,
+              rate: rate(ytdCurC, ytdCur.totalSales),
+              prevYearRate: rate(ytdPyC, ytdPy.totalSales),
+              prevYear: ytdPyC,
+              yoyPct: calcPctSafe(ytdCurC, ytdPyC),
+            },
+          },
+          bars,
+        };
+      }),
+
+    // 수동 인사이트 (채널/카테고리 × 성과/부진요인/해결방안), 월+팀별 저장
+    getInsight: publicProcedure
+      .input(z.object({ year: z.number(), month: z.number(), team: z.string().optional() }))
+      .query(async ({ input }) => {
+        const key = `report_insight_${input.year}_${input.month}${input.team ? `_${input.team}` : ""}`;
+        const raw = await getAppSetting(key);
+        if (!raw) return null;
+        try { return JSON.parse(raw); } catch { return null; }
+      }),
+
+    saveInsight: publicProcedure
+      .input(
+        z.object({
+          year: z.number(),
+          month: z.number(),
+          team: z.string().optional(),
+          data: z.object({
+            channel: z.array(z.object({ label: z.string(), seonggwa: z.string(), buojin: z.string(), haegyeol: z.string() })),
+            category: z.array(z.object({ label: z.string(), seonggwa: z.string(), buojin: z.string(), haegyeol: z.string() })),
+          }),
+        })
+      )
+      .mutation(async ({ input }) => {
+        const key = `report_insight_${input.year}_${input.month}${input.team ? `_${input.team}` : ""}`;
+        await setAppSetting(key, JSON.stringify(input.data));
+        return { success: true };
+      }),
+
+    // ── AI 분석: 월전체요약 / 채널별 / 카테고리별 (월+팀+종류별 저장, 수동수정 가능) ──
+    getAiAnalysis: publicProcedure
+      .input(z.object({ year: z.number(), month: z.number(), team: z.string().optional(), kind: z.enum(["summary", "channel", "category"]) }))
+      .query(async ({ input }) => {
+        const key = `report_ai_${input.kind}_${input.year}_${input.month}${input.team ? `_${input.team}` : ""}`;
+        const raw = await getAppSetting(key);
+        if (!raw) return null;
+        try { return JSON.parse(raw) as { text: string; generatedAt: string; editedAt?: string }; } catch { return null; }
+      }),
+
+    // 수동 수정 저장
+    saveAiAnalysis: publicProcedure
+      .input(z.object({ year: z.number(), month: z.number(), team: z.string().optional(), kind: z.enum(["summary", "channel", "category"]), text: z.string() }))
+      .mutation(async ({ input }) => {
+        const key = `report_ai_${input.kind}_${input.year}_${input.month}${input.team ? `_${input.team}` : ""}`;
+        const raw = await getAppSetting(key);
+        let generatedAt = new Date().toISOString();
+        try { if (raw) generatedAt = JSON.parse(raw).generatedAt ?? generatedAt; } catch {}
+        await setAppSetting(key, JSON.stringify({ text: input.text, generatedAt, editedAt: new Date().toISOString() }));
+        return { success: true };
+      }),
+
+    generateAiAnalysis: publicProcedure
+      .input(z.object({ dept: z.string(), year: z.number(), month: z.number(), team: z.string().optional(), kind: z.enum(["summary", "channel", "category"]) }))
+      .mutation(async ({ input }) => {
+        const { dept, year, month, team, kind } = input;
+        const pad = (n: number) => String(n).padStart(2, "0");
+        const rangeOf = (y: number, m: number) => {
+          const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+          return { start: `${y}-${pad(m)}-01`, end: `${y}-${pad(m)}-${pad(last)}` };
+        };
+        const eok = (v: number) => {
+          const e = Math.floor(Math.abs(v) / 1e8);
+          const man = Math.floor((Math.abs(v) % 1e8) / 1e4);
+          return (v < 0 ? "-" : "") + (e ? `${e}억 ` : "") + (man ? `${man.toLocaleString()}만` : (e ? "" : "0"));
+        };
+        const fmtPctStr = (v: number | null) => (v == null ? "비교불가" : `${v >= 0 ? "+" : ""}${v.toFixed(0)}%`);
+        const perfFn = (p: any) => getItemPerformanceFromMart(p).catch(() => getItemPerformance(p));
+
+        const cur = rangeOf(year, month);
+        const py = rangeOf(year - 1, month);
+        const pmY = month === 1 ? year - 1 : year;
+        const pmM = month === 1 ? 12 : month - 1;
+        const pm = rangeOf(pmY, pmM);
+        const filt = await teamScopeFilt(year, team);
+        const scopeLabel = team ? team : "국내사업팀 전체";
+
+        const monthAgg = await aggregateSalesFromMart({ startDate: cur.start, endDate: cur.end, dept, ...filt }).catch(() => aggregateSales({ startDate: cur.start, endDate: cur.end, dept, ...filt }));
+        if (monthAgg.totalSales === 0) return { text: "해당 월/팀에 매출 데이터가 없습니다.", generatedAt: new Date().toISOString() };
+        const total = monthAgg.totalSales;
+
+        // 그룹별 상위 매출 라인 (전월/전년 대비 포함)
+        const perfLines = async (groupBy: "channel" | "itemMid" | "itemName", limit: number, excludeEtc: boolean) => {
+          let curr = await perfFn({ startDate: cur.start, endDate: cur.end, dept, groupBy, limit: limit + (excludeEtc ? 6 : 0), ...filt });
+          if (excludeEtc) curr = curr.filter((r: any) => !/기타/.test(r.label));
+          curr = curr.slice(0, limit);
+          const names = curr.map((r: any) => r.label);
+          const fk = groupBy === "channel" ? "channels" : groupBy === "itemMid" ? "itemMids" : "itemNames";
+          const [prevY, prevM] = await Promise.all([
+            perfFn({ startDate: py.start, endDate: py.end, dept, groupBy, [fk]: names, ...filt }),
+            perfFn({ startDate: pm.start, endDate: pm.end, dept, groupBy, [fk]: names, ...filt }),
+          ]);
+          const pyMap = new Map(prevY.map((r: any) => [r.label, r.totalSales]));
+          const pmMap = new Map(prevM.map((r: any) => [r.label, r.totalSales]));
+          return curr.map((r: any, i: number) => {
+            const yoy = calcPctSafe(r.totalSales, (pyMap.get(r.label) as number) ?? 0);
+            const mom = calcPctSafe(r.totalSales, (pmMap.get(r.label) as number) ?? 0);
+            const share = total > 0 ? ((r.totalSales / total) * 100).toFixed(0) : "0";
+            const nm = groupBy === "itemMid" ? String(r.label).replace(/_[A-Z]{2}$/, "") : r.label;
+            return `${i + 1}. ${nm} — 매출 ${eok(r.totalSales)} (비중 ${share}%), 전월비 ${fmtPctStr(mom)}, 전년비 ${fmtPctStr(yoy)}`;
+          });
+        };
+
+        let system = "";
+        let user = "";
+        if (kind === "summary") {
+          const [pyAgg, curC, goalArr] = await Promise.all([
+            aggregateSalesFromMart({ startDate: py.start, endDate: py.end, dept, ...filt }).catch(() => ({ totalSales: 0, totalProfit: 0, totalQty: 0 })),
+            getContribMarginForPeriod({ startDate: cur.start, endDate: cur.end, dept, ...filt }),
+            getMonthlyTargetSums(year, team ? { team } : {}),
+          ]);
+          const goal = goalArr[month - 1] ?? 0;
+          const marginRate = total > 0 ? (monthAgg.totalProfit / total) * 100 : 0;
+          const contribRate = total > 0 ? (curC / total) * 100 : 0;
+          const salesYoY = calcPctSafe(total, pyAgg.totalSales);
+          const achieve = goal > 0 ? (total / goal) * 100 : null;
+          const topCh = (await perfFn({ startDate: cur.start, endDate: cur.end, dept, groupBy: "channel", limit: 3, ...filt })).map((r: any) => `${r.label}(${eok(r.totalSales)})`);
+          const topCatRaw = await perfFn({ startDate: cur.start, endDate: cur.end, dept, groupBy: "itemMid", limit: 8, ...filt });
+          const topCat = topCatRaw.filter((r: any) => !/기타/.test(r.label)).slice(0, 3).map((r: any) => `${String(r.label).replace(/_[A-Z]{2}$/, "")}(${eok(r.totalSales)})`);
+          system = `당신은 꿈비(영유아 브랜드) 국내사업팀 매출 분석가입니다. 주어진 이번 달 실적 데이터만 근거로 팀장이 30초에 읽을 '월 전체 요약'을 한국어로 작성하세요. 규칙: 불릿(-) 3개 이내 + 마지막 줄 "👉 한줄평:". 숫자 근거 필수, 데이터에 없는 내용 금지, 간결하게. 마크다운.`;
+          user = `대상: ${year}년 ${month}월 · ${scopeLabel}
+매출액: ${eok(total)}${goal > 0 ? ` (목표 ${eok(goal)}, 달성 ${achieve!.toFixed(0)}%)` : ""}, 전년비 ${fmtPctStr(salesYoY)}
+매출이익: ${eok(monthAgg.totalProfit)} (이익률 ${marginRate.toFixed(1)}%)
+공헌이익: ${eok(curC)} (공헌이익률 ${contribRate.toFixed(1)}%)
+상위 채널: ${topCh.join(", ")}
+상위 카테고리: ${topCat.join(", ")}`;
+        } else if (kind === "channel") {
+          const lines = await perfLines("channel", 8, false);
+          system = `당신은 꿈비 국내사업팀 매출 분석가입니다. 주어진 '채널별 매출' 데이터만 근거로 채널 성과를 간결히 분석하세요. 규칙: 불릿(-) 4개 이내, 각 한 줄, 숫자 근거 필수, 없는 내용 금지. 잘된 채널·부진 채널·특이점 위주. 마지막 줄 "👉 권장 액션:" 1개. 마크다운.`;
+          user = `대상: ${year}년 ${month}월 · ${scopeLabel} (총매출 ${eok(total)})\n\n채널별 매출:\n${lines.join("\n")}`;
+        } else {
+          const lines = await perfLines("itemMid", 8, true);
+          system = `당신은 꿈비 국내사업팀 매출 분석가입니다. 주어진 '카테고리(중분류)별 매출' 데이터만 근거로 간결히 분석하세요. 규칙: 불릿(-) 4개 이내, 각 한 줄, 숫자 근거 필수, 없는 내용 금지. 성장·부진 카테고리 위주. 마지막 줄 "👉 권장 액션:" 1개. 마크다운.`;
+          user = `대상: ${year}년 ${month}월 · ${scopeLabel} (총매출 ${eok(total)})\n\n카테고리(중분류)별 매출:\n${lines.join("\n")}`;
+        }
+
+        const response = await invokeLLM({ messages: [{ role: "system", content: system }, { role: "user", content: user }] });
+        const rawContent = response?.choices?.[0]?.message?.content;
+        const text = typeof rawContent === "string" ? rawContent : "분석 생성에 실패했습니다.";
+        const generatedAt = new Date().toISOString();
+        const key = `report_ai_${kind}_${year}_${month}${team ? `_${team}` : ""}`;
+        await setAppSetting(key, JSON.stringify({ text, generatedAt }));
+        return { text, generatedAt };
+      }),
+  }),
+
+  // ─── SKU별 목표 (담당/팀 매핑) ──────────────────────────────────────────────────
+  productTargets: router({
+    getYears: publicProcedure.query(() => getProductTargetYears()),
+    // 담당자 목록 + 팀 + 담당 품명수 (매출/수익 분석 담당 필터용)
+    getManagers: publicProcedure
+      .input(z.object({ year: z.number() }))
+      .query(async ({ input }) => {
+        // 1순위: '담당자 지정' 매핑(전체 담당자, 소분류 기준). 없으면 product_targets 폴백.
+        const mapMgrs = await getMapManagers().catch(() => []);
+        if (mapMgrs.length) {
+          return mapMgrs.sort((a, b) => a.team.localeCompare(b.team) || b.count - a.count);
+        }
+        const mm = await getManagerMap(input.year);
+        return mm
+          .map((m) => ({ manager: m.manager, team: m.team, count: m.itemNames.length }))
+          .sort((a, b) => a.team.localeCompare(b.team) || b.count - a.count);
+      }),
+  }),
+
+  // ─── 담당자 미지정 SKU 관리 ─────────────────────────────────────────────────────
+  managerAssign: router({
+    // 담당자 미지정 SKU 목록 (마트 manager IS NULL, 매출 큰 순). 기간 옵션.
+    getUnassigned: publicProcedure
+      .input(z.object({ startDate: z.string().optional(), endDate: z.string().optional() }).optional())
+      .query(async ({ input }) => getUnassignedSkus(input ?? {})),
+    // 미지정 요약 (건수 + 매출)
+    getUnassignedSummary: publicProcedure
+      .input(z.object({ startDate: z.string().optional(), endDate: z.string().optional() }).optional())
+      .query(async ({ input }) => getUnassignedSummary(input ?? {})),
+    // 지정 가능한 담당자/팀 목록
+    getManagers: publicProcedure.query(() => getAllManagers()),
+    // 이 SKU(품번)만 담당자 지정 (manual override)
+    assignSku: publicProcedure
+      .input(z.object({
+        itemCode: z.string(), manager: z.string(), team: z.string(),
+        itemName: z.string().optional(), itemSmall: z.string().optional(),
+      }))
+      .mutation(async ({ input }) => {
+        await assignSkuManager(input);
+        await applyOverrideToMart(input.itemCode, input.manager, input.team);
+        queryCache.invalidateAll();
+        return { success: true };
+      }),
+    // 이 소분류 전체를 한 담당자로 지정 (소분류 매핑 등록 + 미지정 행 채움)
+    assignSmall: publicProcedure
+      .input(z.object({ itemSmall: z.string(), manager: z.string(), team: z.string() }))
+      .mutation(async ({ input }) => {
+        await assignSmallManager(input.itemSmall, input.manager, input.team);
+        queryCache.invalidateAll();
+        return { success: true };
       }),
   }),
 
@@ -903,6 +1345,64 @@ export const appRouter = router({
         if (!stored) throw new Error("비밀번호 설정이 없습니다.");
         const ok = bcrypt.compareSync(input.password, stored);
         if (!ok) throw new Error("비밀번호가 올바르지 않습니다.");
+        return { success: true };
+      }),
+  }),
+
+  // ─── 회원 계정 (아이디/비밀번호 + 관리자 승인) ─────────────────────────────────
+  auth: router({
+    // 회원가입: 누구나 가능, 승인 대기 상태로 생성
+    signup: publicProcedure
+      .input(z.object({ id: z.string().trim().min(2, "아이디는 2자 이상").max(64), password: z.string().min(4, "비밀번호는 4자 이상") }))
+      .mutation(async ({ input }) => {
+        const exists = await getAccount(input.id);
+        if (exists) throw new Error("이미 존재하는 아이디입니다.");
+        const bcrypt = await import("bcryptjs");
+        await createAccount(input.id, bcrypt.hashSync(input.password, 10));
+        return { success: true };
+      }),
+    // 로그인: 성공 시 역할/승인여부 반환 (승인 안 됐으면 approved=false)
+    login: publicProcedure
+      .input(z.object({ id: z.string().trim(), password: z.string() }))
+      .mutation(async ({ input }) => {
+        const acc = await getAccount(input.id);
+        if (!acc) throw new Error("아이디 또는 비밀번호가 올바르지 않습니다.");
+        const bcrypt = await import("bcryptjs");
+        if (!bcrypt.compareSync(input.password, acc.passwordHash)) {
+          throw new Error("아이디 또는 비밀번호가 올바르지 않습니다.");
+        }
+        return { id: acc.id, role: acc.role, approved: !!acc.approved };
+      }),
+    // 관리자: 계정 목록/승인/해제/삭제
+    listAccounts: publicProcedure.query(() => listAccounts()),
+    approve: publicProcedure
+      .input(z.object({ id: z.string() }))
+      .mutation(async ({ input }) => { await setAccountApproved(input.id, true); return { success: true }; }),
+    revoke: publicProcedure
+      .input(z.object({ id: z.string() }))
+      .mutation(async ({ input }) => { await setAccountApproved(input.id, false); return { success: true }; }),
+    remove: publicProcedure
+      .input(z.object({ id: z.string() }))
+      .mutation(async ({ input }) => { await deleteAccount(input.id); return { success: true }; }),
+  }),
+
+  // ─── Team(사업팀) ↔ 중분류 매핑 ────────────────────────────────────────────────
+  // appSettings 에 JSON 저장: { "매트사업팀": ["중분류A", ...], "육아용품사업팀": [...] }
+  team: router({
+    getMap: publicProcedure.query(async () => {
+      const raw = await getAppSetting("team_item_mids");
+      if (!raw) return {} as Record<string, string[]>;
+      try {
+        const parsed = JSON.parse(raw);
+        return (parsed && typeof parsed === "object" ? parsed : {}) as Record<string, string[]>;
+      } catch {
+        return {} as Record<string, string[]>;
+      }
+    }),
+    setMap: publicProcedure
+      .input(z.object({ map: z.record(z.string(), z.array(z.string())) }))
+      .mutation(async ({ input }) => {
+        await setAppSetting("team_item_mids", JSON.stringify(input.map));
         return { success: true };
       }),
   }),

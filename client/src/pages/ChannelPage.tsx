@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useLocation } from "wouter";
 import { AppLayout } from "@/components/AppLayout";
 import { DateRangeFilter } from "@/components/DateRangeFilter";
+import { TeamFilter } from "@/components/TeamFilter";
 import { HierarchyFilter } from "@/components/HierarchyFilter";
 import { trpc } from "@/lib/trpc";
 import { fmtAmt, fmtQty } from "@/lib/format";
@@ -56,6 +57,7 @@ export default function ChannelPage() {
       actions={
         <div className="flex items-center gap-2 flex-wrap">
           <HierarchyFilter />
+          <TeamFilter />
           <DateRangeFilter value={filter} onChange={setDateFilter} />
         </div>
       }

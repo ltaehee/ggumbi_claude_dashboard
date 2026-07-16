@@ -8,6 +8,20 @@ export function fmtAmt(val: number | null | undefined): string {
   return `${Math.round(val).toLocaleString("ko-KR")} 원`;
 }
 
+/** 금액 → 억/만 한글 축약 (예: 3,113,120,000 → "31억 1,312만") */
+export function fmtKor(val: number | null | undefined): string {
+  if (val == null || isNaN(val)) return "0";
+  const neg = val < 0;
+  let n = Math.round(Math.abs(val));
+  const eok = Math.floor(n / 100_000_000);
+  const man = Math.floor((n % 100_000_000) / 10_000);
+  const parts: string[] = [];
+  if (eok > 0) parts.push(`${eok.toLocaleString("ko-KR")}억`);
+  if (man > 0) parts.push(`${man.toLocaleString("ko-KR")}만`);
+  if (parts.length === 0) parts.push(`${n.toLocaleString("ko-KR")}`);
+  return (neg ? "-" : "") + parts.join(" ");
+}
+
 /** 수량 → 천 단위 콤마 전체 숫자 (예: 9,000) */
 export function fmtQty(val: number | null | undefined): string {
   if (val == null || isNaN(val)) return "0";

@@ -23,7 +23,8 @@ let _rawPool: mysql.Pool | null = null;
 export async function getDb() {
   if (!_db && process.env.DATABASE_URL) {
     try {
-      _db = drizzle(process.env.DATABASE_URL);
+      // 동일한 keepAlive 풀을 drizzle에서도 사용 (단일 풀 공유)
+      _db = drizzle(getRawPool());
     } catch (error) {
       console.warn("[Database] Failed to connect:", error);
       _db = null;
@@ -32,13 +33,432 @@ export async function getDb() {
   return _db;
 }
 
-/** raw mysql2 pool for bulk operations */
+/** raw mysql2 pool for bulk operations.
+ * TiDB Serverless가 유휴 연결을 끊어 stale 연결로 ECONNRESET이 나는 것을 막기 위해 keepAlive 사용 */
 function getRawPool(): mysql.Pool {
   if (!_rawPool && process.env.DATABASE_URL) {
-    _rawPool = mysql.createPool(process.env.DATABASE_URL);
+    _rawPool = mysql.createPool({
+      uri: process.env.DATABASE_URL,
+      enableKeepAlive: true,
+      keepAliveInitialDelay: 10_000,
+      connectionLimit: 10,
+    });
   }
   if (!_rawPool) throw new Error("No DATABASE_URL");
   return _rawPool;
+}
+
+// ─── Dashboard accounts (아이디/비밀번호 + 관리자 승인) ──────────────────────────
+export async function ensureAccountsTable(): Promise<void> {
+  const pool = getRawPool();
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS dashboard_accounts (
+      id VARCHAR(64) PRIMARY KEY,
+      passwordHash VARCHAR(255) NOT NULL,
+      role VARCHAR(16) NOT NULL DEFAULT 'user',
+      approved TINYINT NOT NULL DEFAULT 0,
+      createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+}
+
+/** 관리자 계정 시드 (이미 있으면 무시 — 비밀번호 덮어쓰지 않음) */
+export async function seedAdminAccount(id: string, passwordHash: string): Promise<void> {
+  const pool = getRawPool();
+  await pool.execute(
+    `INSERT IGNORE INTO dashboard_accounts (id, passwordHash, role, approved) VALUES (?, ?, 'admin', 1)`,
+    [id, passwordHash]
+  );
+}
+
+export async function getAccount(id: string): Promise<{ id: string; passwordHash: string; role: string; approved: number } | null> {
+  const pool = getRawPool();
+  const [rows] = await pool.execute(
+    `SELECT id, passwordHash, role, approved FROM dashboard_accounts WHERE id = ?`,
+    [id]
+  ) as [Array<{ id: string; passwordHash: string; role: string; approved: number }>, unknown];
+  return rows[0] ?? null;
+}
+
+export async function createAccount(id: string, passwordHash: string): Promise<void> {
+  const pool = getRawPool();
+  await pool.execute(
+    `INSERT INTO dashboard_accounts (id, passwordHash, role, approved) VALUES (?, ?, 'user', 0)`,
+    [id, passwordHash]
+  );
+}
+
+export async function listAccounts(): Promise<Array<{ id: string; role: string; approved: number; createdAt: string }>> {
+  const pool = getRawPool();
+  const [rows] = await pool.execute(
+    `SELECT id, role, approved, createdAt FROM dashboard_accounts ORDER BY approved ASC, createdAt DESC`
+  ) as [Array<{ id: string; role: string; approved: number; createdAt: string }>, unknown];
+  return rows;
+}
+
+export async function setAccountApproved(id: string, approved: boolean): Promise<void> {
+  const pool = getRawPool();
+  await pool.execute(`UPDATE dashboard_accounts SET approved = ? WHERE id = ?`, [approved ? 1 : 0, id]);
+}
+
+export async function deleteAccount(id: string): Promise<void> {
+  const pool = getRawPool();
+  await pool.execute(`DELETE FROM dashboard_accounts WHERE id = ?`, [id]);
+}
+
+// ─── SKU별 목표 (product_targets) — 2026 상품별 목표 워크북 적재 ─────────────────
+// SKU당 1행, m1~m12 월목표 + annual. 카테고리/팀/담당자는 이 테이블 SUM으로 자동집계.
+export type ProductTargetRow = {
+  itemName: string;
+  barcode?: string | null;
+  brand?: string | null; // 품목대분류
+  itemMid?: string | null; // 품목중분류
+  planCategory?: string | null; // 사업계획 카테고리
+  manager?: string | null; // 담당자
+  team?: string | null; // 매트사업팀 / 육아용품사업팀
+  months: number[]; // 길이 12 (1~12월)
+};
+
+export async function ensureProductTargetsTable(): Promise<void> {
+  const pool = getRawPool();
+  const mcols = Array.from({ length: 12 }, (_, i) => `m${i + 1} DECIMAL(18,2) NOT NULL DEFAULT 0`).join(",\n      ");
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS product_targets (
+      id BIGINT AUTO_INCREMENT PRIMARY KEY,
+      year INT NOT NULL,
+      itemName VARCHAR(300) NOT NULL,
+      barcode VARCHAR(64),
+      brand VARCHAR(128),
+      itemMid VARCHAR(128),
+      planCategory VARCHAR(128),
+      manager VARCHAR(64),
+      team VARCHAR(64),
+      ${mcols},
+      annual DECIMAL(18,2) NOT NULL DEFAULT 0,
+      KEY idx_year (year),
+      KEY idx_year_team (year, team),
+      KEY idx_year_manager (year, manager),
+      KEY idx_year_name (year, itemName)
+    )
+  `);
+}
+
+/** 특정 연도 목표 전체 교체 (delete + bulk insert) */
+export async function replaceProductTargetsForYear(year: number, rows: ProductTargetRow[]): Promise<number> {
+  const pool = getRawPool();
+  await ensureProductTargetsTable();
+  await pool.execute(`DELETE FROM product_targets WHERE year = ?`, [year]);
+  if (rows.length === 0) return 0;
+
+  const cols = ["year", "itemName", "barcode", "brand", "itemMid", "planCategory", "manager", "team",
+    ...Array.from({ length: 12 }, (_, i) => `m${i + 1}`), "annual"];
+  const rowPh = "(" + cols.map(() => "?").join(",") + ")";
+  const BATCH = 200;
+  let total = 0;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const chunk = rows.slice(i, i + BATCH);
+    const vals: any[] = [];
+    const ph: string[] = [];
+    for (const r of chunk) {
+      const months = (r.months || []).slice(0, 12);
+      while (months.length < 12) months.push(0);
+      const annual = months.reduce((s, x) => s + (Number(x) || 0), 0);
+      ph.push(rowPh);
+      vals.push(year, r.itemName, r.barcode ?? null, r.brand ?? null, r.itemMid ?? null, r.planCategory ?? null,
+        r.manager ?? null, r.team ?? null, ...months.map((x) => Number(x) || 0), annual);
+    }
+    await pool.query(`INSERT INTO product_targets (${cols.join(",")}) VALUES ${ph.join(",")}`, vals);
+    total += chunk.length;
+  }
+  return total;
+}
+
+export async function getProductTargetYears(): Promise<number[]> {
+  const pool = getRawPool();
+  await ensureProductTargetsTable();
+  const [rows] = await pool.execute(`SELECT DISTINCT year FROM product_targets ORDER BY year DESC`) as [Array<{ year: number }>, unknown];
+  return rows.map((r) => r.year);
+}
+
+/** 담당자별 팀 + 담당 품명 목록 (매출/수익 분석 담당 필터용) */
+export async function getManagerMap(year: number): Promise<Array<{ manager: string; team: string; itemNames: string[] }>> {
+  const pool = getRawPool();
+  await ensureProductTargetsTable();
+  const [rows] = await pool.execute(
+    `SELECT manager, team, itemName FROM product_targets WHERE year = ? AND manager IS NOT NULL AND manager <> ''`,
+    [year]
+  ) as [Array<{ manager: string; team: string; itemName: string }>, unknown];
+  const map = new Map<string, { manager: string; team: string; itemNames: Set<string> }>();
+  for (const r of rows) {
+    if (!map.has(r.manager)) map.set(r.manager, { manager: r.manager, team: r.team ?? "", itemNames: new Set() });
+    if (r.itemName) map.get(r.manager)!.itemNames.add(r.itemName);
+  }
+  return [...map.values()].map((m) => ({ manager: m.manager, team: m.team, itemNames: [...m.itemNames] }));
+}
+
+/** 팀별 담당 품명 목록 (월간 리포트 팀 버튼용) */
+export async function getTeamItemNames(year: number, team: string): Promise<string[]> {
+  const pool = getRawPool();
+  await ensureProductTargetsTable();
+  const [rows] = await pool.execute(
+    `SELECT DISTINCT itemName FROM product_targets WHERE year = ? AND team = ? AND itemName <> ''`,
+    [year, team]
+  ) as [Array<{ itemName: string }>, unknown];
+  return rows.map((r) => r.itemName);
+}
+
+// ─── 품목소분류 → 담당자 매핑 (item_manager_map) — '담당자 지정' 파일 적재 ─────────
+// 소분류 1개당 담당자 1명. 신상품·AS·반품도 소분류만 맞으면 자동 담당 지정.
+// SKU 목표(product_targets)와 별개: 목표=금액, 이 테이블=담당 소유권(전체 매출 커버).
+export type ItemManagerRow = { itemSmall: string; manager: string; team: string };
+
+export async function ensureItemManagerMapTable(): Promise<void> {
+  const pool = getRawPool();
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS item_manager_map (
+      itemSmall VARCHAR(191) PRIMARY KEY,
+      manager VARCHAR(64) NOT NULL,
+      team VARCHAR(64) NOT NULL,
+      updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      KEY idx_manager (manager),
+      KEY idx_team (team)
+    )
+  `);
+  // uploaded_files.fileType ENUM 에 'managerMap' 추가 (idempotent, 기존 값 영향 없음)
+  try {
+    await pool.execute(
+      `ALTER TABLE uploaded_files MODIFY COLUMN fileType ENUM('sales','bom','target','promotion','inventory','managerMap') NOT NULL`
+    );
+  } catch { /* 이미 반영됨 or 권한 이슈 — 무시 */ }
+}
+
+/** 담당자 지정 전체 교체 (delete + bulk insert) */
+export async function replaceItemManagerMap(rows: ItemManagerRow[]): Promise<number> {
+  const pool = getRawPool();
+  await ensureItemManagerMapTable();
+  await pool.execute(`DELETE FROM item_manager_map`);
+  if (rows.length === 0) return 0;
+  const BATCH = 200;
+  let total = 0;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const chunk = rows.slice(i, i + BATCH);
+    const ph = chunk.map(() => "(?,?,?)").join(",");
+    const vals: any[] = [];
+    for (const r of chunk) vals.push(r.itemSmall, r.manager, r.team);
+    await pool.query(`INSERT INTO item_manager_map (itemSmall, manager, team) VALUES ${ph}`, vals);
+    total += chunk.length;
+  }
+  return total;
+}
+
+/** 전체 매핑 조회 */
+export async function getItemManagerMapAll(): Promise<ItemManagerRow[]> {
+  const pool = getRawPool();
+  await ensureItemManagerMapTable();
+  const [rows] = await pool.execute(`SELECT itemSmall, manager, team FROM item_manager_map`) as [ItemManagerRow[], unknown];
+  return rows;
+}
+
+/** 담당자 목록(+팀, 담당 소분류 수) — 담당 필터 드롭다운용 */
+export async function getMapManagers(): Promise<Array<{ manager: string; team: string; count: number }>> {
+  const pool = getRawPool();
+  await ensureItemManagerMapTable();
+  const [rows] = await pool.execute(
+    `SELECT manager, team, COUNT(*) AS count FROM item_manager_map GROUP BY manager, team`
+  ) as [Array<{ manager: string; team: string; count: number | string }>, unknown];
+  return rows.map((r) => ({ manager: r.manager, team: r.team, count: Number(r.count) }));
+}
+
+/** 담당자/팀 → 담당 소분류 목록 (매출 스코핑용). 매핑 없으면 빈 배열 */
+export async function getScopeSmalls(opts: { manager?: string; team?: string }): Promise<string[]> {
+  const pool = getRawPool();
+  await ensureItemManagerMapTable();
+  const cond: string[] = [];
+  const vals: any[] = [];
+  if (opts.manager) { cond.push("manager = ?"); vals.push(opts.manager); }
+  else if (opts.team) { cond.push("team = ?"); vals.push(opts.team); }
+  else return [];
+  const [rows] = await pool.execute(
+    `SELECT itemSmall FROM item_manager_map WHERE ${cond.join(" AND ")}`, vals
+  ) as [Array<{ itemSmall: string }>, unknown];
+  return rows.map((r) => r.itemSmall);
+}
+
+// ─── 품번(SKU) → 담당자 오버라이드 (sku_manager_override) ─────────────────────────
+// 소분류로 자동지정 안 되는 케이스(충돌 소분류/개별 지정)를 품번 단위로 해결.
+// 우선순위: 품번 오버라이드 > 소분류 매핑 > 미지정. source: 'file'(담당 파일 시드) | 'manual'(UI 지정)
+export type SkuOverrideRow = { itemCode: string; manager: string; team: string; itemName?: string; itemSmall?: string; source?: "file" | "manual" };
+
+export async function ensureSkuOverrideTable(): Promise<void> {
+  const pool = getRawPool();
+  await pool.execute(`
+    CREATE TABLE IF NOT EXISTS sku_manager_override (
+      itemCode VARCHAR(64) PRIMARY KEY,
+      manager VARCHAR(64) NOT NULL,
+      team VARCHAR(64) NOT NULL,
+      itemName VARCHAR(300),
+      itemSmall VARCHAR(191),
+      source VARCHAR(16) NOT NULL DEFAULT 'manual',
+      updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      KEY idx_manager (manager),
+      KEY idx_team (team)
+    )
+  `);
+}
+
+/** 담당 파일에서 나온 품번 오버라이드 갱신(source='file'만 교체, manual 지정은 보존) */
+export async function replaceFileSkuOverrides(rows: SkuOverrideRow[]): Promise<number> {
+  const pool = getRawPool();
+  await ensureSkuOverrideTable();
+  // 파일 소스만 제거 후 재적재 — 사용자가 UI로 넣은 manual 지정은 유지
+  await pool.execute(`DELETE FROM sku_manager_override WHERE source = 'file'`);
+  if (rows.length === 0) return 0;
+  const BATCH = 300;
+  let total = 0;
+  for (let i = 0; i < rows.length; i += BATCH) {
+    const chunk = rows.slice(i, i + BATCH);
+    const ph = chunk.map(() => "(?,?,?,?,?, 'file')").join(",");
+    const vals: any[] = [];
+    for (const r of chunk) vals.push(r.itemCode, r.manager, r.team, r.itemName ?? null, r.itemSmall ?? null);
+    // manual 지정이 이미 있는 품번은 사용자의 명시적 선택을 존중해 건드리지 않음
+    await pool.query(
+      `INSERT INTO sku_manager_override (itemCode, manager, team, itemName, itemSmall, source) VALUES ${ph}
+       ON DUPLICATE KEY UPDATE itemName = VALUES(itemName), itemSmall = VALUES(itemSmall)`,
+      vals
+    );
+    total += chunk.length;
+  }
+  return total;
+}
+
+/** UI에서 개별 품번 담당자 지정(manual) */
+export async function assignSkuManager(row: SkuOverrideRow & { itemName?: string; itemSmall?: string }): Promise<void> {
+  const pool = getRawPool();
+  await ensureSkuOverrideTable();
+  await pool.execute(
+    `INSERT INTO sku_manager_override (itemCode, manager, team, itemName, itemSmall, source)
+     VALUES (?,?,?,?,?, 'manual')
+     ON DUPLICATE KEY UPDATE manager = VALUES(manager), team = VALUES(team), source = 'manual'`,
+    [row.itemCode, row.manager, row.team, row.itemName ?? null, row.itemSmall ?? null]
+  );
+}
+
+/** 담당자/팀 → 담당 품명 목록 (마트의 baked manager 기준). 매출 스코핑용. */
+export async function getScopedItemNames(opts: { manager?: string; team?: string }): Promise<string[]> {
+  const pool = getRawPool();
+  await ensureMartManagerCols();
+  const cond: string[] = ["itemName IS NOT NULL", "itemName <> ''"];
+  const vals: any[] = [];
+  if (opts.manager) { cond.push("manager = ?"); vals.push(opts.manager); }
+  else if (opts.team) { cond.push("team = ?"); vals.push(opts.team); }
+  else return [];
+  const [rows] = await pool.execute(
+    `SELECT DISTINCT itemName FROM sales_daily_mart WHERE ${cond.join(" AND ")}`, vals
+  ) as [Array<{ itemName: string }>, unknown];
+  return rows.map((r) => r.itemName);
+}
+
+/** 담당자 미지정 SKU 목록 (마트 manager IS NULL). 매출 큰 순. 기간 필터 옵션. */
+export async function getUnassignedSkus(opts: { startDate?: string; endDate?: string } = {}): Promise<Array<{
+  itemCode: string; itemName: string; itemSmall: string; totalSales: number; totalQty: number;
+}>> {
+  const pool = getRawPool();
+  await ensureMartManagerCols();
+  const cond: string[] = ["manager IS NULL", "itemCode IS NOT NULL", "itemCode <> ''"];
+  const vals: any[] = [];
+  if (opts.startDate) { cond.push("salesDate >= ?"); vals.push(opts.startDate); }
+  if (opts.endDate) { cond.push("salesDate <= ?"); vals.push(opts.endDate); }
+  const [rows] = await pool.execute(
+    `SELECT itemCode,
+            MAX(itemName) AS itemName,
+            MAX(itemSmall) AS itemSmall,
+            SUM(totalSalesAmt) AS totalSales,
+            SUM(totalQty) AS totalQty
+     FROM sales_daily_mart
+     WHERE ${cond.join(" AND ")}
+     GROUP BY itemCode
+     ORDER BY totalSales DESC`,
+    vals
+  ) as [Array<{ itemCode: string; itemName: string; itemSmall: string; totalSales: string; totalQty: string }>, unknown];
+  return rows.map((r) => ({
+    itemCode: r.itemCode,
+    itemName: r.itemName ?? "",
+    itemSmall: r.itemSmall ?? "",
+    totalSales: Number(r.totalSales ?? 0),
+    totalQty: Number(r.totalQty ?? 0),
+  }));
+}
+
+/** 담당자 미지정 SKU 요약 (건수 + 매출) — 업로드 결과 알림용 */
+export async function getUnassignedSummary(opts: { startDate?: string; endDate?: string } = {}): Promise<{ count: number; totalSales: number }> {
+  const pool = getRawPool();
+  await ensureMartManagerCols();
+  const cond: string[] = ["manager IS NULL", "itemCode IS NOT NULL", "itemCode <> ''"];
+  const vals: any[] = [];
+  if (opts.startDate) { cond.push("salesDate >= ?"); vals.push(opts.startDate); }
+  if (opts.endDate) { cond.push("salesDate <= ?"); vals.push(opts.endDate); }
+  const [rows] = await pool.execute(
+    `SELECT COUNT(DISTINCT itemCode) AS cnt, SUM(totalSalesAmt) AS sales
+     FROM sales_daily_mart WHERE ${cond.join(" AND ")}`,
+    vals
+  ) as [Array<{ cnt: number | string; sales: string | null }>, unknown];
+  return { count: Number(rows[0]?.cnt ?? 0), totalSales: Number(rows[0]?.sales ?? 0) };
+}
+
+/** UI 지정 후 해당 품번의 마트 행 manager/team 즉시 반영 (재빌드 없이) */
+export async function applyOverrideToMart(itemCode: string, manager: string, team: string): Promise<void> {
+  const pool = getRawPool();
+  await ensureMartManagerCols();
+  await pool.execute(
+    `UPDATE sales_daily_mart SET manager = ?, team = ? WHERE itemCode = ?`,
+    [manager, team, itemCode]
+  );
+}
+
+/** 소분류 전체를 한 담당자로 지정 (소분류 매핑 upsert + 미지정 마트 행 채움) */
+export async function assignSmallManager(itemSmall: string, manager: string, team: string): Promise<void> {
+  const pool = getRawPool();
+  await ensureItemManagerMapTable();
+  await ensureMartManagerCols();
+  await pool.execute(
+    `INSERT INTO item_manager_map (itemSmall, manager, team) VALUES (?,?,?)
+     ON DUPLICATE KEY UPDATE manager = VALUES(manager), team = VALUES(team)`,
+    [itemSmall, manager, team]
+  );
+  // 품번 오버라이드가 없는(=미지정) 행만 채움 — 오버라이드 우선순위 보존
+  await pool.execute(
+    `UPDATE sales_daily_mart SET manager = ?, team = ? WHERE itemSmall = ? AND manager IS NULL`,
+    [manager, team, itemSmall]
+  );
+}
+
+/** 담당자/팀 통합 목록 (오버라이드 + 소분류 매핑) — 지정 드롭다운용 */
+export async function getAllManagers(): Promise<Array<{ manager: string; team: string }>> {
+  const pool = getRawPool();
+  await ensureItemManagerMapTable();
+  await ensureSkuOverrideTable();
+  const [rows] = await pool.execute(
+    `SELECT manager, team FROM (
+       SELECT manager, team FROM item_manager_map
+       UNION
+       SELECT manager, team FROM sku_manager_override
+     ) u GROUP BY manager, team ORDER BY team, manager`
+  ) as [Array<{ manager: string; team: string }>, unknown];
+  return rows;
+}
+
+/** 월별 목표 합계(1~12월). team/manager로 필터 가능 */
+export async function getMonthlyTargetSums(year: number, opts: { team?: string; manager?: string } = {}): Promise<number[]> {
+  const pool = getRawPool();
+  await ensureProductTargetsTable();
+  const cond = ["year = ?"];
+  const vals: any[] = [year];
+  if (opts.team) { cond.push("team = ?"); vals.push(opts.team); }
+  if (opts.manager) { cond.push("manager = ?"); vals.push(opts.manager); }
+  const sums = Array.from({ length: 12 }, (_, i) => `SUM(m${i + 1}) AS m${i + 1}`).join(", ");
+  const [rows] = await pool.execute(`SELECT ${sums} FROM product_targets WHERE ${cond.join(" AND ")}`, vals) as [any[], unknown];
+  const r = rows[0] || {};
+  return Array.from({ length: 12 }, (_, i) => Number(r[`m${i + 1}`] || 0));
 }
 
 // ─── Auth helpers ──────────────────────────────────────────────────────────────
@@ -82,7 +502,7 @@ export async function getUserByOpenId(openId: string) {
 // ─── Upload history ────────────────────────────────────────────────────────────
 export async function insertUploadRecord(data: {
   filename: string;
-  fileType: "sales" | "bom" | "target" | "promotion" | "inventory";
+  fileType: "sales" | "bom" | "target" | "promotion" | "inventory" | "managerMap";
   rowCount: number;
   uploadedBy?: string;
 }) {
@@ -369,7 +789,7 @@ export async function getTrendData(params: {
   startDate: string;
   endDate: string;
   dept?: string;
-  groupBy: "weekLabel" | "yearMonth" | "yearStr";
+  groupBy: "weekLabel" | "yearMonth" | "yearStr" | "day";
   channels?: string[];
   itemLarges?: string[];
   itemMids?: string[];
@@ -394,7 +814,9 @@ export async function getTrendData(params: {
       ? salesRecords.weekLabel
       : params.groupBy === "yearMonth"
         ? salesRecords.yearMonth
-        : salesRecords.yearStr;
+        : params.groupBy === "day"
+          ? (sql<string>`DATE_FORMAT(salesDate, '%m/%d')` as any)
+          : salesRecords.yearStr;
 
   const rows = await db
     .select({
@@ -588,11 +1010,14 @@ export async function getPromotionsByMonth(year: number, month: number) {
   const db = await getDb();
   if (!db) return [];
   const startStr = `${year}-${String(month).padStart(2, "0")}-01`;
-  const endStr = `${year}-${String(month).padStart(2, "0")}-31`;
+  // 다음 달 1일을 상한 경계로 사용 (예: 6월의 '2026-06-31' 같은 무효 날짜로 쿼리가 깨지는 문제 방지)
+  const nextYear = month === 12 ? year + 1 : year;
+  const nextMonth = month === 12 ? 1 : month + 1;
+  const nextStr = `${nextYear}-${String(nextMonth).padStart(2, "0")}-01`;
   const rows = await db
     .select()
     .from(promotions)
-    .where(sql`(startDate <= ${endStr} AND endDate >= ${startStr})`);
+    .where(sql`(startDate < ${nextStr} AND endDate >= ${startStr})`);
   return rows.map((r) => ({
     ...r,
     startDate: r.startDate ? (r.startDate as Date).toISOString().split("T")[0] : null,
@@ -1360,35 +1785,55 @@ export async function deleteMartByFilename(filename: string): Promise<number> {
 }
 
 /** salesRecords에서 특정 파일의 데이터를 집계하여 마트 테이블에 삽입 */
+let _martColsEnsured = false;
+/** sales_daily_mart 에 manager/team 컬럼 보강 (idempotent) */
+export async function ensureMartManagerCols(): Promise<void> {
+  if (_martColsEnsured) return;
+  const pool = getRawPool();
+  const tryExec = async (sql: string) => { try { await pool.execute(sql); } catch { /* 이미 존재 */ } };
+  await tryExec(`ALTER TABLE sales_daily_mart ADD COLUMN manager VARCHAR(64) NULL`);
+  await tryExec(`ALTER TABLE sales_daily_mart ADD COLUMN team VARCHAR(64) NULL`);
+  await tryExec(`ALTER TABLE sales_daily_mart ADD INDEX mart_manager (manager)`);
+  await tryExec(`ALTER TABLE sales_daily_mart ADD INDEX mart_team (team)`);
+  _martColsEnsured = true;
+}
+
 export async function buildMartFromFilename(filename: string): Promise<number> {
   const pool = getRawPool();
-  // salesRecords에서 해당 파일 데이터를 날짜×부서×채널×분류별로 집계 후 마트에 INSERT
+  await ensureMartManagerCols();
+  await ensureSkuOverrideTable();
+  await ensureItemManagerMapTable();
+  // salesRecords에서 해당 파일 데이터를 집계 + 담당자 해석(품번 오버라이드→소분류 매핑)하여 마트에 INSERT
   const [result] = await pool.execute(
     `INSERT INTO sales_daily_mart
       (salesDate, yearMonth, yearStr, weekLabel, dept, channel,
        itemLarge, itemMid, itemSmall, itemName, itemCode,
-       totalSalesAmt, totalQty, totalGrossProfit, rowCount, sourceFilename)
+       totalSalesAmt, totalQty, totalGrossProfit, rowCount, sourceFilename, manager, team)
      SELECT
-       salesDate,
-       yearMonth,
-       yearStr,
-       weekLabel,
-       dept,
-       channel,
-       itemLarge,
-       itemMid,
-       itemSmall,
-       itemName,
-       itemCode,
-       SUM(salesAmt) AS totalSalesAmt,
-       SUM(qty) AS totalQty,
-       SUM(COALESCE(grossProfit, 0)) AS totalGrossProfit,
+       sr.salesDate,
+       sr.yearMonth,
+       sr.yearStr,
+       sr.weekLabel,
+       sr.dept,
+       sr.channel,
+       sr.itemLarge,
+       sr.itemMid,
+       sr.itemSmall,
+       sr.itemName,
+       sr.itemCode,
+       SUM(sr.salesAmt) AS totalSalesAmt,
+       SUM(sr.qty) AS totalQty,
+       SUM(COALESCE(sr.grossProfit, 0)) AS totalGrossProfit,
        COUNT(*) AS rowCount,
-       ? AS sourceFilename
-     FROM sales_records
-     WHERE sourceFilename = ?
-     GROUP BY salesDate, yearMonth, yearStr, weekLabel, dept, channel,
-              itemLarge, itemMid, itemSmall, itemName, itemCode`,
+       ? AS sourceFilename,
+       MAX(COALESCE(ov.manager, sm.manager)) AS manager,
+       MAX(COALESCE(ov.team, sm.team)) AS team
+     FROM sales_records sr
+     LEFT JOIN sku_manager_override ov ON ov.itemCode = sr.itemCode
+     LEFT JOIN item_manager_map sm ON sm.itemSmall = sr.itemSmall
+     WHERE sr.sourceFilename = ?
+     GROUP BY sr.salesDate, sr.yearMonth, sr.yearStr, sr.weekLabel, sr.dept, sr.channel,
+              sr.itemLarge, sr.itemMid, sr.itemSmall, sr.itemName, sr.itemCode`,
     [filename, filename]
   ) as [mysql.ResultSetHeader, unknown];
   return result.affectedRows ?? 0;
@@ -1548,7 +1993,7 @@ export async function getTrendDataFromMart(params: {
   startDate: string;
   endDate: string;
   dept?: string;
-  groupBy: "weekLabel" | "yearMonth" | "yearStr";
+  groupBy: "weekLabel" | "yearMonth" | "yearStr" | "day";
   channels?: string[];
   itemLarges?: string[];
   itemMids?: string[];
@@ -1581,18 +2026,19 @@ export async function getTrendDataFromMart(params: {
     values.push(...params.itemNames);
   }
 
-  const groupCol = params.groupBy; // weekLabel, yearMonth, yearStr
+  // day(일별)는 컬럼이 아니라 날짜 포맷으로 그룹화 (예: 06/24). 그 외는 라벨 컬럼.
+  const groupExpr = params.groupBy === "day" ? "DATE_FORMAT(salesDate, '%m/%d')" : params.groupBy;
   const where = conditions.join(" AND ");
 
     const [rows] = await pool.execute(
-    `SELECT ${groupCol} AS label,
+    `SELECT ${groupExpr} AS label,
             SUM(totalSalesAmt) AS totalSales,
             SUM(totalQty) AS totalQty,
             MIN(salesDate) AS minDate,
             MAX(salesDate) AS maxDate
      FROM sales_daily_mart
      WHERE ${where}
-     GROUP BY ${groupCol}
+     GROUP BY ${groupExpr}
      ORDER BY MIN(salesDate)`,
     values
   ) as [Array<{ label: string; totalSales: string; totalQty: string; minDate: string; maxDate: string }>, unknown];
@@ -1641,23 +2087,30 @@ export async function rebuildMartFromAllRecords(forceRebuild = false): Promise<{
   const nullMartCount = Number(nullCheck[0]?.cnt ?? 0);
 
   if (nullMartCount === 0) {
+    await ensureMartManagerCols();
+    await ensureSkuOverrideTable();
+    await ensureItemManagerMapTable();
     const [nullResult] = await pool.execute(
       `INSERT INTO sales_daily_mart
         (salesDate, yearMonth, yearStr, weekLabel, dept, channel,
          itemLarge, itemMid, itemSmall, itemName, itemCode,
-         totalSalesAmt, totalQty, totalGrossProfit, rowCount, sourceFilename)
+         totalSalesAmt, totalQty, totalGrossProfit, rowCount, sourceFilename, manager, team)
        SELECT
-         salesDate, yearMonth, yearStr, weekLabel, dept, channel,
-         itemLarge, itemMid, itemSmall, itemName, itemCode,
-         SUM(salesAmt) AS totalSalesAmt,
-         SUM(qty) AS totalQty,
-         SUM(COALESCE(grossProfit, 0)) AS totalGrossProfit,
+         sr.salesDate, sr.yearMonth, sr.yearStr, sr.weekLabel, sr.dept, sr.channel,
+         sr.itemLarge, sr.itemMid, sr.itemSmall, sr.itemName, sr.itemCode,
+         SUM(sr.salesAmt) AS totalSalesAmt,
+         SUM(sr.qty) AS totalQty,
+         SUM(COALESCE(sr.grossProfit, 0)) AS totalGrossProfit,
          COUNT(*) AS rowCount,
-         NULL AS sourceFilename
-       FROM sales_records
-       WHERE sourceFilename IS NULL
-       GROUP BY salesDate, yearMonth, yearStr, weekLabel, dept, channel,
-                itemLarge, itemMid, itemSmall, itemName, itemCode`
+         NULL AS sourceFilename,
+         MAX(COALESCE(ov.manager, sm.manager)) AS manager,
+         MAX(COALESCE(ov.team, sm.team)) AS team
+       FROM sales_records sr
+       LEFT JOIN sku_manager_override ov ON ov.itemCode = sr.itemCode
+       LEFT JOIN item_manager_map sm ON sm.itemSmall = sr.itemSmall
+       WHERE sr.sourceFilename IS NULL
+       GROUP BY sr.salesDate, sr.yearMonth, sr.yearStr, sr.weekLabel, sr.dept, sr.channel,
+                sr.itemLarge, sr.itemMid, sr.itemSmall, sr.itemName, sr.itemCode`
     ) as [mysql.ResultSetHeader, unknown];
     const nullBuilt = nullResult.affectedRows ?? 0;
     if (nullBuilt > 0) {
